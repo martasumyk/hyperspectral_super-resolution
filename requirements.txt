@@ -1,0 +1,17 @@
+earthaccess>=0.9
+xarray>=2024.1
+numpy>=1.24
+matplotlib>=3.7
+netCDF4>=1.6
+h5netcdf>=1.3
+rioxarray>=0.15
+pyproj>=3.6
+hvplot>=0.9
+holoviews>=1.18
+panel>=1.4
+geoviews>=1.11
+spectral>=0.23
+scikit-image>=0.20
+# Optional but useful
+rasterio>=1.3
+scipy>=1.10
