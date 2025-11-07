@@ -145,58 +145,42 @@ def emit_quicklook_matplotlib(
     ds: xr.Dataset,
     *,
     rfl_var: str = "reflectance",
-    wavelengths_var: str = "wavelengths",     # fallback if coord is missing
+    wavelengths_var: str = "wavelengths",  
     good_var: str = "good_wavelengths",
-    target_rgb_nm=(665.0, 560.0, 492.0),      # R, G, B target wavelengths (nm)
-    grayscale_nm: float | None = None,        # if set, show single-band instead of RGB
-    percentile=(2, 98),                       # contrast stretch percentiles
-    gamma: float = 1/2.2,                     # sRGB-ish display gamma
-    white_balance: bool = True,               # gray-world WB for RGB
-    origin: str = "upper",                    # "upper" or "lower"
-    ax: plt.Axes | None = None,               # pass an axes to draw on
-    return_arrays: bool = False               # return arrays & metadata
+    target_rgb_nm=(665.0, 560.0, 492.0),  
+    grayscale_nm: float | None = None,    
+    percentile=(2, 98),                       
+    gamma: float = 1/2.2,                   
+    white_balance: bool = True,             
+    origin: str = "upper",                
+    ax: plt.Axes | None = None,           
+    return_arrays: bool = False            
 ):
-    """
-    Build a natural-looking quicklook from an EMIT L2A Dataset using Matplotlib.
-
-    Returns:
-        ax (matplotlib Axes)
-        (optional) dict with keys:
-            'picked_nm' (tuple/list), 'band_idx' (tuple/list), 'rgb_disp' (H,W,3) or 'gray_disp' (H,W),
-            'spec_dim' (str)
-    """
     if rfl_var not in ds.data_vars:
-        # pick first data_var as a fallback
         rfl_var = next(iter(ds.data_vars))
 
-    # --- wavelengths: use coord if present, else dataset variable ---
     if "wavelength_nm" in ds.coords:
         wl = np.asarray(ds["wavelength_nm"].values)
     elif wavelengths_var in ds:
         wl = np.asarray(ds[wavelengths_var].values)
-        # attach as a coord to the spectral dim (below)
     else:
         raise ValueError("No wavelengths found: need coord 'wavelength_nm' or variable "
                          f"'{wavelengths_var}' in the dataset.")
 
     nwl = wl.size
 
-    # --- find spectral dimension by matching length to #wavelengths ---
     spec_candidates = [d for d in ds[rfl_var].dims if ds.sizes[d] == nwl]
     if not spec_candidates:
-        # last-resort: any dataset dim with size == nwl
         spec_candidates = [d for d, sz in ds.sizes.items() if sz == nwl]
     if len(spec_candidates) != 1:
         raise ValueError(f"Can't uniquely determine spectral dimension of length {nwl}. "
                          f"Candidates: {spec_candidates}")
     spec_dim = spec_candidates[0]
 
-    # attach coord if missing or mismatched
     if "wavelength_nm" not in ds.coords or ds.coords["wavelength_nm"].sizes.get(spec_dim, 0) != nwl:
         ds = ds.assign_coords({"wavelength_nm": (spec_dim, wl)})
     wl = np.asarray(ds["wavelength_nm"].values)  # refresh
 
-    # --- good_wavelengths alignment (optional) ---
     if good_var in ds:
         gw = ds[good_var]
         if gw.ndim != 1 or gw.sizes.get(spec_dim, None) != nwl:
@@ -213,7 +197,6 @@ def emit_quicklook_matplotlib(
         i = int(good_idx[np.argmin(np.abs(wl[good_idx] - target_nm))])
         return i, float(wl[i])
 
-    # ---- helpers ----
     def pct_stretch(img, p_low=2, p_high=98):
         out = np.empty_like(img, dtype=np.float32)
         if img.ndim == 3:  # RGB
@@ -230,7 +213,6 @@ def emit_quicklook_matplotlib(
                   np.clip((img - lo) / (hi - lo), 0, 1)
         return out
 
-    # --- build image ---
     if grayscale_nm is not None:
         idx, nm = nearest_good_index(grayscale_nm)
         band = ds[rfl_var].isel({spec_dim: idx}).values.astype(np.float32)
@@ -248,7 +230,6 @@ def emit_quicklook_matplotlib(
         payload = {"picked_nm": (nm,), "band_idx": (idx,), "gray_disp": gray_disp, "spec_dim": spec_dim}
         return (ax, payload) if return_arrays else ax
 
-    # RGB path
     idx_r, nm_r = nearest_good_index(target_rgb_nm[0])
     idx_g, nm_g = nearest_good_index(target_rgb_nm[1])
     idx_b, nm_b = nearest_good_index(target_rgb_nm[2])
@@ -261,14 +242,12 @@ def emit_quicklook_matplotlib(
     rgb[~np.isfinite(rgb)] = np.nan
     rgb = np.clip(rgb, 0, 1)
 
-    # contrast & WB
     rgb = pct_stretch(rgb, *percentile)
     if white_balance:
         means = np.nanmean(rgb.reshape(-1, 3), axis=0)
         scale = np.nanmean(means) / np.maximum(means, 1e-6)
         rgb = np.clip(rgb * scale, 0, 1)
 
-    # gamma for display
     rgb_disp = np.clip(rgb, 0, 1) ** gamma
 
     if ax is None:

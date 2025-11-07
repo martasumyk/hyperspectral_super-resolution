@@ -42,14 +42,14 @@ def point_buffer_bbox(lon: float, lat: float, meters: float):
     return Polygon(zip(lons, lats))
 
 def search(*, bbox=None, point=None, buffer_m=5000.0, start: dt.datetime, end: dt.datetime,
-           short_name: str = EMIT_SHORT_NAME) -> List:
+           short_name: str = EMIT_SHORT_NAME, cloud_cover = [0,100]) -> List:
     if bbox is None and point is None:
         raise ValueError("Provide either bbox or point")
     if bbox is None:
         poly = point_buffer_bbox(point[0], point[1], buffer_m)
         bbox = poly.bounds 
         
-    result = ea.search_data(short_name=short_name, temporal=(start, end), bounding_box=bbox)
+    result = ea.search_data(short_name=short_name, temporal=(start, end), bounding_box=bbox, cloud_cover=cloud_cover)
     if len(result) == 0:
         print("No granules found for the given search criteria.")
         return None
