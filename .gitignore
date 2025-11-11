@@ -3,6 +3,7 @@ __pycache__/
 *.pyc
 *.pyo
 *.pyd
+*/__pycache__/
 # Ignore Jupyter Notebook checkpoints
 .ipynb_checkpoints/
 # Ignore virtual environment directories
@@ -23,3 +24,5 @@ tmp/
 # Ignore IDE specific files
 .vscode/
 .idea/
+emit_out/
+emit_tmp/
