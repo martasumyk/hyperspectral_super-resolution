@@ -4,12 +4,6 @@
 SISTER
 Space-based Imaging Spectroscopy and Thermal PathfindER
 
-Adds:
-- CRS/resolution matching to Sentinel-2 (or explicit EPSG)
-- ENVI outputs (as before)
-- XML sidecars with rich metadata (times, bbox, waves/FWHM, CRS/EPSG, pixel size)
-
-Author: adapted for Marta by ChatGPT
 """
 
 import datetime as dt
