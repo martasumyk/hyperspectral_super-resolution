@@ -3,7 +3,7 @@ login, search, choose_nearest, download_reflectance,
 open_reflectance, attach_wavelengths
 )
 from .geo import get_pixel_center_coords, apply_glt, ortho_xr
-from .viz import plot_band_nm, rgb_from_nm, hv_quicklook
+# from .viz import plot_band_nm, rgb_from_nm, hv_quicklook
 from .emit_tools import (
     quality_mask, band_mask,
     spatial_subset, merge_emit, write_envi, envi_header,

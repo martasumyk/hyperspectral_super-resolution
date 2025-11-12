@@ -208,6 +208,377 @@ def _write_xml_sidecar(
     _pretty_write_xml(root, out_xml)
 
 
+# def nc_to_envi(
+#     img_file: str,
+#     out_dir: str,
+#     temp_dir: str,
+#     obs_file: str | None = None,
+#     export_loc: bool = False,
+#     crid: str = "000",
+#     s2_tif_path: str | None = None,  # derive CRS/res from Sentinel-2 GeoTIFF
+#     epsg: int | str | None = None,   # (kept unused to match current behavior)
+#     match_res: bool = False,         # copy pixel size from S2
+#     write_xml: bool = True           # write XML sidecar(s)
+# ):
+#     """
+#     Export EMIT L1B_RDN or L2A_RFL to ENVI and write XML sidecars.
+#     (Speed-tuned version: precomputed GLT indices, BSQ interleave, GDAL skip-nosource, threading/cache.)
+#     """
+#     import os, glob, subprocess
+#     import numpy as np
+#     import rasterio
+#     import netCDF4 as nc
+#     import datetime as dt
+
+#     os.makedirs(out_dir, exist_ok=True)
+#     os.makedirs(temp_dir, exist_ok=True)
+
+#     img_nc = nc.Dataset(img_file)
+#     try:
+#         # --- speed: disable netCDF masking/scaling (we handle NoData ourselves) ---
+#         if hasattr(img_nc, "set_auto_mask"):
+#             img_nc.set_auto_mask(False)
+#         for vname in ("radiance", "reflectance"):
+#             if vname in img_nc.variables and hasattr(img_nc.variables[vname], "set_auto_maskandscale"):
+#                 img_nc.variables[vname].set_auto_maskandscale(False)
+
+#         # Product & data
+#         if "radiance" in img_nc.variables.keys():
+#             data = img_nc["radiance"]
+#             product = "L1B_RDN"
+#             description = "Radiance micro-watts/cm^2/nm/sr"
+#         elif "reflectance" in img_nc.variables.keys():
+#             data = img_nc["reflectance"]
+#             product = "L2A_RFL"
+#             description = "Reflectance (unitless)"
+#         else:
+#             print("Unrecognized input image dataset (expected 'radiance' or 'reflectance').")
+#             return
+
+#         # Bands metadata
+#         fwhm = img_nc["sensor_band_parameters"]["fwhm"][:].data
+#         waves = img_nc["sensor_band_parameters"]["wavelengths"][:].data
+
+#         # Geotransform/GLT
+#         gt = np.array(img_nc.__dict__["geotransform"])
+#         glt = np.zeros(list(img_nc.groups["location"]["glt_x"].shape) + [2], dtype=np.int32)
+#         glt[..., 0] = np.array(img_nc.groups["location"]["glt_x"])
+#         glt[..., 1] = np.array(img_nc.groups["location"]["glt_y"])
+#         valid_glt = np.all(glt != 0, axis=-1)
+#         glt[valid_glt] -= 1  # 1-based -> 0-based
+
+#         # --- speed: precompute gather indices once ---
+#         gy = glt[..., 1][valid_glt]
+#         gx = glt[..., 0][valid_glt]
+
+#         # ENVI header 'map info' as list (Geographic, degrees)
+#         map_info = [
+#             "Geographic Lat/Lon",
+#             1, 1,
+#             float(gt[0]), float(gt[3]),
+#             float(gt[1]), float(-gt[5]),
+#             "WGS-84",
+#             "units=degrees",
+#         ]
+
+#         # Extents & time
+#         latitude = np.array(img_nc.groups["location"]["lat"])
+#         longitude = np.array(img_nc.groups["location"]["lon"])
+
+#         corner_1 = [float(longitude[0, 0]), float(latitude[0, 0])]
+#         corner_2 = [float(longitude[0, -1]), float(latitude[0, -1])]
+#         corner_3 = [float(longitude[-1, -1]), float(latitude[-1, -1])]
+#         corner_4 = [float(longitude[-1, 0]), float(latitude[-1, 0])]
+
+#         # Robust time parse (keeps original format if present)
+#         try:
+#             start_time = dt.datetime.strptime(img_nc.time_coverage_start, "%Y-%m-%dT%H:%M:%S+0000")
+#             end_time = dt.datetime.strptime(img_nc.time_coverage_end, "%Y-%m-%dT%H:%M:%S+0000")
+#         except ValueError:
+#             start_time = dt.datetime.strptime(img_nc.time_coverage_start.replace("Z", "+0000"), "%Y-%m-%dT%H:%M:%S+0000")
+#             end_time = dt.datetime.strptime(img_nc.time_coverage_end.replace("Z", "+0000"), "%Y-%m-%dT%H:%M:%S+0000")
+
+#         # Prepare unprojected ENVI (GCS) container to warp from
+#         data_header = ht.io.envi_header_dict()
+#         data_header["lines"] = glt.shape[0]
+#         data_header["samples"] = glt.shape[1]
+#         data_header["bands"] = data.shape[2]
+#         data_header["byte order"] = 0
+#         data_header["data ignore value"] = NO_DATA_VALUE
+#         data_header["data type"] = 4
+#         # --- speed: BSQ is friendlier for GDAL warps than BIL ---
+#         data_header["interleave"] = "bsq"
+#         data_header["map info"] = map_info
+
+#         data_gcs = f"{temp_dir}/data_gcs"
+#         writer = ht.io.WriteENVI(data_gcs, data_header)
+#         data_prj = np.full((glt.shape[0], glt.shape[1]), NO_DATA_VALUE, dtype=np.float32)
+
+#         print(f"Exporting EMIT {product} dataset")
+#         # --- speed: precomputed gy/gx + single fill() per iteration ---
+#         for band_num in range(data.shape[2]):
+#             band = data[:, :, band_num]
+#             data_prj[valid_glt] = band[gy, gx]
+#             writer.write_band(data_prj, band_num)
+#             data_prj.fill(NO_DATA_VALUE)
+
+#         # Choose target CRS & resolution (keep original behavior: derive from S2 only)
+#         tr_opt = "-tr 60 60"
+#         out_crs = None
+#         out_epsg_int = None
+#         out_ps = (60.0, 60.0)
+#         crs_wkt = None
+
+#         if s2_tif_path:
+#             with rasterio.open(s2_tif_path) as src:
+#                 s2_crs = src.crs
+#                 out_crs = s2_crs.to_string()
+#                 out_epsg_int = s2_crs.to_epsg()
+#                 crs_wkt = s2_crs.to_wkt()
+#                 if match_res and src.res is not None:
+#                     out_ps = (abs(float(src.res[0])), abs(float(src.res[1])))
+#                     tr_opt = f"-tr {out_ps[0]} {out_ps[1]}"
+
+#         # Warp helper with safe args & faster options
+#         def _run_warp(src_path: str, dst_path: str):
+#             # thread/cache env (don’t override if user already set them)
+#             os.environ.setdefault("GDAL_NUM_THREADS", "ALL_CPUS")
+#             os.environ.setdefault("GDAL_CACHEMAX", "1024")  # MB
+
+#             nodata = [ "-srcnodata", str(NO_DATA_VALUE), "-dstnodata", str(NO_DATA_VALUE) ]
+#             # --- speed: skip all-empty source blocks, unified nodata, init dest as NoData ---
+#             skip = [ "-wo", "SKIP_NOSOURCE=YES", "-wo", "UNIFIED_SRC_NODATA=YES", "-wo", "INIT_DEST=NO_DATA" ]
+#             multi = [ "-multi", "-wo", "NUM_THREADS=ALL_CPUS", "-wm", "1024" ]
+
+#             args = [
+#                 "gdalwarp", "-overwrite",
+#                 "-t_srs", out_crs if out_crs is not None else "",
+#                 *tr_opt.split(),
+#                 "-r", "near",
+#                 *nodata, *skip, *multi,
+#                 "-of", "ENVI",
+#                 src_path, dst_path
+#             ]
+#             # remove empty items if out_crs is None to avoid passing a blank
+#             args = [a for a in args if a != ""]
+#             subprocess.run(args, check=True)
+
+#         # Warp data
+#         print(f"Projecting data to {out_crs} {'(match S2 res)' if match_res else '(60 m)'}")
+#         data_utm = f'{out_dir}/SISTER_EMIT_{product}_{start_time.strftime("%Y%m%dT%H%M%S")}_{crid}.bin'
+#         _run_warp(data_gcs, data_utm)
+
+#         # Fix header
+#         data_hdr = data_utm.replace(".bin", ".hdr")
+#         data_header = ht.io.envi.parse_envi_header(data_hdr)
+#         data_header["description"] = description
+#         data_header["band names"] = []  # keep as original behavior
+#         data_header["fwhm"] = fwhm.tolist()
+#         data_header["wavelength"] = waves.tolist()
+#         data_header["wavelength units"] = "nanometers"
+#         data_header["start acquisition time"] = start_time.strftime("%Y-%m-%dT%H:%M:%SZ")
+#         data_header["end acquisition time"] = end_time.strftime("%Y-%m-%dT%H:%M:%SZ")
+#         data_header["bounding box"] = [corner_1, corner_2, corner_3, corner_4]
+#         data_header["coordinate system string"] = []
+#         data_header["sensor type"] = "EMIT"
+#         if "map info" in data_header and isinstance(data_header["map info"], list):
+#             if any(isinstance(v, str) and v.lower().startswith("units=") for v in data_header["map info"]):
+#                 data_header["map info"] = [
+#                     ("units=Meters" if (isinstance(v, str) and v.lower().startswith("units=")) else v)
+#                     for v in data_header["map info"]
+#                 ]
+#             else:
+#                 data_header["map info"].append("units=Meters")
+#         ht.io.envi.write_envi_header(data_hdr, data_header)
+
+#         # Optional XML for DATA cube
+#         if write_xml:
+#             # We don't know the warped lines/samples without reading; parse from header fields:
+#             lines = int(data_header.get("lines", 0))
+#             samples = int(data_header.get("samples", 0))
+#             _write_xml_sidecar(
+#                 data_utm,
+#                 product=product,
+#                 epsg_str=f"EPSG:{out_epsg_int}" if out_epsg_int else out_crs,
+#                 crs_wkt=crs_wkt,
+#                 pixel_size=out_ps if match_res else (60.0, 60.0),
+#                 shape=(lines, samples, data.shape[2]),
+#                 start_time=start_time,
+#                 end_time=end_time,
+#                 bbox_lonlat=[corner_1, corner_2, corner_3, corner_4],
+#                 wavelengths=waves.tolist() if hasattr(waves, "tolist") else list(waves),
+#                 fwhm=fwhm.tolist() if hasattr(fwhm, "tolist") else list(fwhm),
+#                 band_names=None,
+#                 description=description,
+#             )
+
+#         # Location export
+#         if export_loc:
+#             print("Exporting EMIT location dataset")
+#             loc_header = ht.io.envi_header_dict()
+#             loc_header["lines"] = glt.shape[0]
+#             loc_header["samples"] = glt.shape[1]
+#             loc_header["bands"] = 3
+#             loc_header["byte order"] = 0
+#             loc_header["data ignore value"] = NO_DATA_VALUE
+#             loc_header["data type"] = 4
+#             loc_header["interleave"] = "bsq"  # faster for GDAL
+#             loc_header["map info"] = map_info
+
+#             loc_gcs = f"{temp_dir}/loc_gcs"
+#             writer = ht.io.WriteENVI(loc_gcs, loc_header)
+
+#             # turn off autoscale for location vars (if present)
+#             loc_vars = img_nc.groups["location"].variables
+#             for name in ("lon", "lat", "elev"):
+#                 v = loc_vars.get(name)
+#                 if v is not None and hasattr(v, "set_auto_maskandscale"):
+#                     v.set_auto_maskandscale(False)
+
+#             loc_band = np.full((glt.shape[0], glt.shape[1]), NO_DATA_VALUE, dtype=np.float32)
+#             for band_num, band_name in enumerate(("lon", "lat", "elev")):
+#                 band = loc_vars[band_name][:]
+#                 loc_band[valid_glt] = band[gy, gx]
+#                 writer.write_band(loc_band, band_num)
+#                 loc_band.fill(NO_DATA_VALUE)
+
+#             loc_utm = f'{out_dir}/SISTER_EMIT_{product}_{start_time.strftime("%Y%m%dT%H%M%S")}_{crid}_LOC.bin'
+#             print(f"Projecting location datacube to {out_crs} {'(match S2 res)' if match_res else '(60 m)'}")
+#             _run_warp(loc_gcs, loc_utm)
+
+#             loc_hdr = loc_utm.replace(".bin", ".hdr")
+#             loc_header = ht.io.envi.parse_envi_header(loc_hdr)
+#             loc_header["band names"] = ["longitude", "latitude", "elevation"]
+#             loc_header["description"] = "Location datacube"
+#             loc_header["coordinate system string"] = []
+#             loc_header["start acquisition time"] = start_time.strftime("%Y-%m-%dT%H:%M:%SZ")
+#             loc_header["end acquisition time"] = end_time.strftime("%Y-%m-%dT%H:%M:%SZ")
+#             loc_header["bounding box"] = [corner_1, corner_2, corner_3, corner_4]
+#             loc_header["sensor type"] = "EMIT"
+#             if "map info" in loc_header and isinstance(loc_header["map info"], list):
+#                 if any(isinstance(v, str) and v.lower().startswith("units=") for v in loc_header["map info"]):
+#                     loc_header["map info"] = [
+#                         ("units=Meters" if (isinstance(v, str) and v.lower().startswith("units=")) else v)
+#                         for v in loc_header["map info"]
+#                     ]
+#                 else:
+#                     loc_header["map info"].append("units=Meters")
+#             ht.io.envi.write_envi_header(loc_hdr, loc_header)
+
+#             if write_xml:
+#                 lines = int(loc_header.get("lines", 0))
+#                 samples = int(loc_header.get("samples", 0))
+#                 _write_xml_sidecar(
+#                     loc_utm,
+#                     product=f"{product}_LOC",
+#                     epsg_str=f"EPSG:{out_epsg_int}" if out_epsg_int else out_crs,
+#                     crs_wkt=crs_wkt,
+#                     pixel_size=out_ps if match_res else (60.0, 60.0),
+#                     shape=(lines, samples, 3),
+#                     start_time=start_time,
+#                     end_time=end_time,
+#                     bbox_lonlat=[corner_1, corner_2, corner_3, corner_4],
+#                     band_names=["longitude", "latitude", "elevation"],
+#                     description="Location datacube",
+#                 )
+
+#         # OBS export
+#         if obs_file:
+#             print("Exporting EMIT observation dataset")
+#             obs_nc = nc.Dataset(obs_file)
+#             try:
+#                 # ---- robust read of OBS cube ----
+#                 try:
+#                     obs_cube, obs_bandnames = _read_obs_cube_and_names(obs_nc)  # (H, W, K)
+#                 except Exception as e:
+#                     print(f"[WARN] Could not parse OBS file '{obs_file}': {e}")
+#                     print("Skipping OBS export. (Pass obs_file=None to silence this.)")
+#                     obs_nc.close()
+#                     obs_nc = None
+
+#                 if obs_nc is not None:
+#                     obs_header = ht.io.envi_header_dict()
+#                     obs_header["lines"] = glt.shape[0]
+#                     obs_header["samples"] = glt.shape[1]
+#                     obs_header["bands"] = obs_cube.shape[2]
+#                     obs_header["byte order"] = 0
+#                     obs_header["data ignore value"] = NO_DATA_VALUE
+#                     obs_header["data type"] = 4
+#                     obs_header["interleave"] = "bsq"  # faster for GDAL
+#                     obs_header["map info"] = map_info
+
+#                     obs_gcs = f"{temp_dir}/obs_gcs"
+#                     writer = ht.io.WriteENVI(obs_gcs, obs_header)
+
+#                     obs_band = np.full((glt.shape[0], glt.shape[1]), NO_DATA_VALUE, dtype=np.float32)
+#                     for band_num in range(obs_cube.shape[2]):
+#                         band = obs_cube[..., band_num]
+#                         obs_band[valid_glt] = band[gy, gx]
+#                         writer.write_band(obs_band, band_num)
+#                         obs_band.fill(NO_DATA_VALUE)
+
+#                     obs_utm = f'{out_dir}/SISTER_EMIT_{product}_{start_time.strftime("%Y%m%dT%H%M%S")}_{crid}_OBS.bin'
+#                     print(f'Projecting observation datacube to {out_crs} {("(match S2 res)" if match_res else "(60 m)")}')
+#                     _run_warp(obs_gcs, obs_utm)
+
+#                     # Update header
+#                     obs_header_file = obs_utm.replace(".bin", ".hdr")
+#                     obs_header = ht.io.envi.parse_envi_header(obs_header_file)
+#                     obs_header["band names"] = obs_bandnames
+#                     obs_header["description"] = "Observation datacube"
+#                     obs_header["coordinate system string"] = []
+#                     obs_header["start acquisition time"] = start_time.strftime("%Y-%m-%dT%H:%M:%SZ")
+#                     obs_header["end acquisition time"] = end_time.strftime("%Y-%m-%dT%H:%M:%SZ")
+#                     obs_header["bounding box"] = [corner_1, corner_2, corner_3, corner_4]
+#                     obs_header["sensor type"] = "EMIT"
+#                     if "map info" in obs_header and isinstance(obs_header["map info"], list):
+#                         if any(isinstance(v, str) and v.lower().startswith("units=") for v in obs_header["map info"]):
+#                             obs_header["map info"] = [
+#                                 ("units=Meters" if (isinstance(v, str) and v.lower().startswith("units=")) else v)
+#                                 for v in obs_header["map info"]
+#                             ]
+#                         else:
+#                             obs_header["map info"].append("units=Meters")
+#                     ht.io.envi.write_envi_header(obs_header_file, obs_header)
+
+#                     if write_xml:
+#                         lines = int(obs_header.get("lines", 0))
+#                         samples = int(obs_header.get("samples", 0))
+#                         _write_xml_sidecar(
+#                             obs_utm,
+#                             product=f"{product}_OBS",
+#                             epsg_str=f"EPSG:{out_epsg_int}" if out_epsg_int else out_crs,
+#                             crs_wkt=crs_wkt,
+#                             pixel_size=out_ps if match_res else (60.0, 60.0),
+#                             shape=(lines, samples, obs_cube.shape[2]),
+#                             start_time=start_time,
+#                             end_time=end_time,
+#                             bbox_lonlat=[corner_1, corner_2, corner_3, corner_4],
+#                             band_names=obs_bandnames,
+#                             description="Observation datacube",
+#                         )
+#             finally:
+#                 try:
+#                     if obs_nc is not None:
+#                         obs_nc.close()
+#                 except Exception:
+#                     pass
+
+#         # Clean GDAL aux XMLs (not the sidecars we wrote):
+#         for xml in glob.glob(f"{out_dir}/*.xml"):
+#             if xml.endswith(".aux.xml"):
+#                 try:
+#                     os.remove(xml)
+#                 except Exception:
+#                     pass
+#     finally:
+#         try:
+#             img_nc.close()
+#         except Exception:
+#             pass
+
+
+
 def nc_to_envi(
     img_file: str,
     out_dir: str,
@@ -249,7 +620,20 @@ def nc_to_envi(
     os.makedirs(out_dir, exist_ok=True)
     os.makedirs(temp_dir, exist_ok=True)
 
+
     img_nc = nc.Dataset(img_file)
+    print(f"Opened EMIT image dataset: {img_file}")
+
+    for vname in ("radiance", "reflectance"):
+        if vname in img_nc.variables:
+            var = img_nc.variables[vname]
+            if hasattr(var, "set_auto_maskandscale"):
+                print(f"Disabling auto mask/scale for variable '{vname}'")
+                var.set_auto_maskandscale(False)
+
+    # optional: disable dataset-level auto masking for everything (faster, no masked arrays)
+    if hasattr(img_nc, "set_auto_mask"):
+        img_nc.set_auto_mask(False)
 
     # Product & data
     if "radiance" in img_nc.variables.keys():
@@ -313,10 +697,13 @@ def nc_to_envi(
     data_prj = np.full((glt.shape[0], glt.shape[1]), NO_DATA_VALUE, dtype=np.float32)
 
     print(f"Exporting EMIT {product} dataset")
+    gy = glt[..., 1][valid_glt]
+    gx = glt[..., 0][valid_glt]
     for band_num in range(data.shape[2]):
-        data_prj[valid_glt] = data[:, :, band_num][glt[valid_glt, 1], glt[valid_glt, 0]]
+        band = data[:, :, band_num]          # netCDF slice -> ndarray
+        data_prj[valid_glt] = band[gy, gx]   # gather via precomputed indices
         writer.write_band(data_prj, band_num)
-        data_prj[:] = NO_DATA_VALUE
+        data_prj.fill(NO_DATA_VALUE)
 
     # Choose target CRS & resolution
     tr_opt = "-tr 60 60"
@@ -411,12 +798,17 @@ def nc_to_envi(
         loc_gcs = f"{temp_dir}/loc_gcs"
         writer = ht.io.WriteENVI(loc_gcs, loc_header)
 
+        loc_vars = img_nc.groups["location"].variables
+        # for name in ("lon", "lat", "elev"):
+        #     if hasattr(loc_vars[name], "set_auto_maskandscale"):
+        #         loc_vars[name].set_auto_maskandscale(False)
+
         loc_band = np.full((glt.shape[0], glt.shape[1]), NO_DATA_VALUE, dtype=np.float32)
-        for band_num, band_name in enumerate(["lon", "lat", "elev"]):
-            band = np.copy(img_nc.groups["location"][band_name])
-            loc_band[valid_glt] = band[glt[valid_glt, 1], glt[valid_glt, 0]]
+        for band_num, name in enumerate(("lon", "lat", "elev")):
+            band = loc_vars[name][:]              # read once; no np.copy()
+            loc_band[valid_glt] = band[gy, gx]
             writer.write_band(loc_band, band_num)
-            loc_band[:] = NO_DATA_VALUE
+            loc_band.fill(NO_DATA_VALUE)
 
         loc_utm = f'{out_dir}/SISTER_EMIT_{product}_{start_time.strftime("%Y%m%dT%H%M%S")}_{crid}_LOC.bin'
         print(f"Projecting location datacube to {out_crs} {'(match S2 res)' if match_res else '(60 m)'}")
@@ -488,12 +880,11 @@ def nc_to_envi(
             writer = ht.io.WriteENVI(obs_gcs, obs_header)
 
             obs_band = np.full((glt.shape[0], glt.shape[1]), NO_DATA_VALUE, dtype=np.float32)
-
             for band_num in range(obs_cube.shape[2]):
-                band = obs_cube[:, :, band_num]
-                obs_band[valid_glt] = band[glt[valid_glt, 1], glt[valid_glt, 0]]
+                band = obs_cube[..., band_num]
+                obs_band[valid_glt] = band[gy, gx]
                 writer.write_band(obs_band, band_num)
-                obs_band[:] = NO_DATA_VALUE
+                obs_band.fill(NO_DATA_VALUE)
 
             obs_utm = f'{out_dir}/SISTER_EMIT_{product}_{start_time.strftime("%Y%m%dT%H%M%S")}_{crid}_OBS.bin'
             print(f'Projecting observation datacube to {out_crs} {("(match S2 res)" if match_res else "(60 m)")}')
