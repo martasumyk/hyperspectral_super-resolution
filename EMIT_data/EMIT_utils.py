@@ -5,6 +5,7 @@ from pathlib import Path
 from typing import Iterable, List, Optional, Sequence, Tuple
 import pyproj
 from shapely.geometry import Point, box, Polygon
+from shapely.geometry import mapping
 
 import numpy as np
 import xarray as xr
@@ -122,5 +123,94 @@ def attach_wavelengths(ds: xr.Dataset, data_var: str = 'reflectance') -> xr.Data
         dim = ds[data_var].dims[-1]
     return ds.assign_coords({ 'wavelength_nm': (dim, wl) })
 
+
+
+def _emit_window_from_roi(url: str, roi_geom_wgs84) -> Tuple[int, int, int, int]:
+    """
+    Given an EMIT L2A .nc URL and an ROI polygon in WGS84,
+    return (row_min, row_max, col_min, col_max) in downtrack/crosstrack space.
+    """
+    # Get authenticated HTTPS session (no full download)
+    fs = ea.get_fsspec_https_session()
+    
+    # Open ONLY the location group to get lat/lon (much smaller than reflectance)
+    loc_ds = xr.open_dataset(
+        fs.open(url),
+        group="location",
+        engine="h5netcdf",
+        chunks={}
+    )
+    lat = loc_ds["latitude"]   # dims: (downtrack, crosstrack)
+    lon = loc_ds["longitude"]
+
+    minx, miny, maxx, maxy = roi_geom_wgs84.bounds
+
+    in_roi = ((lon >= minx) & (lon <= maxx) &
+              (lat >= miny) & (lat <= maxy))
+
+    # Find rows/cols that intersect ROI at least once
+    rows = np.where(in_roi.any(dim="crosstrack"))[0]
+    cols = np.where(in_roi.any(dim="downtrack"))[0]
+
+    if len(rows) == 0 or len(cols) == 0:
+        raise ValueError("ROI does not intersect this EMIT granule")
+
+    row_min, row_max = int(rows[0]), int(rows[-1])
+    col_min, col_max = int(cols[0]), int(cols[-1])
+
+    return row_min, row_max, col_min, col_max
+
+
+def download_reflectance_roi(
+    pick,
+    roi_geom_wgs84,
+    dest_dir: Path | str,
+    assets: List[str] = ["_RFL_", "_MASK_"],
+    pad_px: int = 0,
+) -> List[Path]:
+    """
+    For a single EMIT granule (`pick`), stream the L2A RFL/MASK files
+    and save ONLY the ROI subset (downtrack/crosstrack window) to disk.
+
+    Returns list of paths to ROI-subsetted .nc files.
+    """
+    dest = Path(dest_dir)
+    dest.mkdir(parents=True, exist_ok=True)
+
+    # Find URLs for RFL/MASK .nc files
+    links = _filter_rfl_links(pick.data_links(), desired_assets=assets)
+    if not links:
+        raise RuntimeError("No EMIT L2A Reflectance .nc links for the selected granule")
+
+    # Use the reflectance file to compute window (location group is the same)
+    rfl_url = [u for u in links if "_RFL_" in u][0]
+
+    row_min, row_max, col_min, col_max = _emit_window_from_roi(rfl_url, roi_geom_wgs84)
+
+    # Optional pixel padding around ROI
+    row_min = max(row_min - pad_px, 0)
+    col_min = max(col_min - pad_px, 0)
+    row_max = row_max + pad_px
+    col_max = col_max + pad_px
+
+    fs = ea.get_fsspec_https_session()
+    out_paths: List[Path] = []
+
+    for url in links:
+        # Stream file, but only slice the small window
+        with fs.open(url) as fp:
+            ds = xr.open_dataset(fp, engine="h5netcdf", chunks={})
+
+            # EMIT uses downtrack / crosstrack
+            ds_roi = ds.isel(
+                downtrack=slice(row_min, row_max + 1),
+                crosstrack=slice(col_min, col_max + 1),
+            )
+
+        out_path = dest / (Path(url).stem + "_ROI.nc")
+        ds_roi.to_netcdf(out_path)
+        out_paths.append(out_path)
+
+    return out_paths
 
 
