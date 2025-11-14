@@ -63,6 +63,14 @@ def download_asset(href, out_path):
     return str(out_path)
 
 def plot_s2_truecolor(paths, ax=None):
+<<<<<<< HEAD
+=======
+
+    def stretch01(x):
+        p2, p98 = np.nanpercentile(x, [2, 98])
+        return np.clip((x - p2) / (p98 - p2 + 1e-6), 0, 1)
+
+>>>>>>> 4877e4b (aaaaaaa)
     if len(paths) == 1:
         p = paths[0]
         with rasterio.open(p) as ds:
@@ -89,9 +97,25 @@ def plot_s2_truecolor(paths, ax=None):
              rasterio.open(bands["G"]) as g, \
              rasterio.open(bands["B"]) as b:
 
+<<<<<<< HEAD
             R = r.read(1).astype("float32")
             G = g.read(1, out_shape=(r.height, r.width), resampling=Resampling.bilinear).astype("float32")
             B = b.read(1, out_shape=(r.height, r.width), resampling=Resampling.bilinear).astype("float32")
+=======
+            for i in range(3):
+                rgb[..., i] = stretch01(rgb[..., i])
+        if ax is not None:
+            ax.imshow(rgb)
+            ax.set_title("Sentinel-2 true color")
+            ax.axis("off")
+            return
+        plt.figure(figsize=(7,7))
+        plt.imshow(rgb)
+        plt.title("Sentinel-2 true color")
+        plt.axis("off")
+        plt.show()
+        return
+>>>>>>> 4877e4b (aaaaaaa)
 
         rgb = np.dstack([R, G, B])
         if np.nanmax(rgb) > 1.5:
