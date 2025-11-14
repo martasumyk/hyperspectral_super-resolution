@@ -26,3 +26,4 @@ tmp/
 .idea/
 emit_out/
 emit_tmp/
+pairs_output/
