@@ -62,57 +62,50 @@ def download_asset(href, out_path):
                 pbar.update(len(chunk))
     return str(out_path)
 
-def plot_s2_truecolor(paths):
-
-    def stretch01(x):
-        p2, p98 = np.nanpercentile(x, [2, 98])
-        return np.clip((x - p2) / (p98 - p2 + 1e-6), 0, 1)
-
+def plot_s2_truecolor(paths, ax=None):
     if len(paths) == 1:
         p = paths[0]
         with rasterio.open(p) as ds:
+            idx = [1, 2, 3] if ds.count >= 3 else [1, 1, 1]
+            arr = ds.read(idx).astype("float32")
+        rgb = np.moveaxis(arr, 0, -1)
 
+        if np.nanmax(rgb) > 1.5:
+            rgb = rgb / 10000.0
 
-            count = ds.count
-            idx = [1,2,3] if count >= 3 else [1]*3
-            arr = ds.read(idx, masked=True)          # (3, H, W)
-            rgb = np.moveaxis(arr, 0, -1).astype("float32")  # (H, W, 3)
-            rgb = np.where(np.ma.getmaskarray(rgb), np.nan, rgb)
+    else:
+        paths = list(map(Path, paths))
+        bands = {}
+        for p in paths:
+            n = p.name
+            if "_B04" in n: bands["R"] = str(p)
+            if "_B03" in n: bands["G"] = str(p)
+            if "_B02" in n: bands["B"] = str(p)
 
+        if not all(k in bands for k in ("R", "G", "B")):
+            raise ValueError("Expected B04, B03, and B02 bands for RGB composite.")
 
+        with rasterio.open(bands["R"]) as r, \
+             rasterio.open(bands["G"]) as g, \
+             rasterio.open(bands["B"]) as b:
 
-            for i in range(3):
-                rgb[..., i] = stretch01(rgb[..., i])
-        plt.figure(figsize=(7,7))
-        plt.imshow(rgb)
-        plt.title("Sentinel-2 true color")
-        plt.axis("off")
-        plt.show()
-        return
+            R = r.read(1).astype("float32")
+            G = g.read(1, out_shape=(r.height, r.width), resampling=Resampling.bilinear).astype("float32")
+            B = b.read(1, out_shape=(r.height, r.width), resampling=Resampling.bilinear).astype("float32")
 
-    bands = {}
-    for p in paths:
-        p = Path(p)
-        if "_B04" in p.name: bands["R"] = p
-        if "_B03" in p.name: bands["G"] = p
-        if "_B02" in p.name: bands["B"] = p
-    if not all(k in bands for k in ("R","G","B")):
-        print("Missing RGB bands for visualization.")
-        return
+        rgb = np.dstack([R, G, B])
+        if np.nanmax(rgb) > 1.5:
+            rgb = rgb / 10000.0
 
-    with rasterio.open(bands["R"]) as r, \
-         rasterio.open(bands["G"]) as g, \
-         rasterio.open(bands["B"]) as b:
+    valid = np.isfinite(rgb)
+    p2, p98 = np.nanpercentile(rgb[valid], [2, 98])
+    rgb = np.clip((rgb - p2) / (p98 - p2 + 1e-6), 0, 1)
 
-        R = r.read(1).astype("float32")
-        G = g.read(1, out_shape=(r.height, r.width), resampling=Resampling.bilinear).astype("float32")
-        B = b.read(1, out_shape=(r.height, r.width), resampling=Resampling.bilinear).astype("float32")
+    if ax is None:
+        _, ax = plt.subplots(figsize=(7, 7))
 
-        rgb = np.dstack([stretch01(R), stretch01(G), stretch01(B)])
+    ax.imshow(rgb)
+    ax.set_title("Sentinel-2 true color (B04, B03, B02)")
+    ax.axis("off")
 
-    plt.figure(figsize=(7,7))
-    plt.imshow(rgb)
-    plt.title("Sentinel-2 True Color (composed B04/B03/B02)")
-    plt.axis("off")
-    plt.show()
-
+    return rgb
