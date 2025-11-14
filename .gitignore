@@ -27,3 +27,4 @@ tmp/
 emit_out/
 emit_tmp/
 pairs_output/
+.DS_Store
