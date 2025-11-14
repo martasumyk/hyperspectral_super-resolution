@@ -15,18 +15,39 @@ SCL_NAMES = {
     4:"Vegetation",5:"Bare soils",6:"Water",7:"Unclassified",8:"Cloud med",9:"Cloud high",10:"Thin cirrus",11:"Snow/Ice"
 }
 
+# CLOUD_CLASSES = {8, 9, 10, 11}
+
+# def count_cloud_pixels(scl_path: str, roi_geom_wgs84):
+#     """Return (#cloud_pixels, #total_valid_pixels) within ROI from an SCL raster."""
+#     with rasterio.open(scl_path) as ds:
+#         roi_proj = reproject_geom(roi_geom_wgs84, ds.crs)
+#         data, _ = rio_mask(ds, [mapping(roi_proj)], crop=True)
+#         scl = data[0]
+#         valid = scl != 0
+#         total = int(valid.sum())
+#         clouds = int(np.isin(scl, list(CLOUD_CLASSES)).sum())
+#     return clouds, total
+
 CLOUD_CLASSES = {8, 9, 10, 11}
 
-def count_cloud_pixels(scl_path: str, roi_geom_wgs84):
-    """Return (#cloud_pixels, #total_valid_pixels) within ROI from an SCL raster."""
-    with rasterio.open(scl_path) as ds:
+def count_cloud_pixels(scl_href: str, roi_geom_wgs84):
+    """Return (#cloud_pixels, #total_valid_pixels) within ROI from an SCL raster (local file or URL)."""
+    with rasterio.open(scl_href) as ds:
+        # roi_geom_wgs84 is in EPSG:4326; reproject to the SCL raster CRS
         roi_proj = reproject_geom(roi_geom_wgs84, ds.crs)
         data, _ = rio_mask(ds, [mapping(roi_proj)], crop=True)
+
         scl = data[0]
+
         valid = scl != 0
         total = int(valid.sum())
+
+        # If you want cloud fraction only on valid pixels:
+        # clouds = int(np.isin(scl, list(CLOUD_CLASSES)) & valid).sum()
         clouds = int(np.isin(scl, list(CLOUD_CLASSES)).sum())
+
     return clouds, total
+
 
 def find_asset_key(assets, candidates):
     """Return the first key from `candidates` that exists in assets (case-insensitive)."""
