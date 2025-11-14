@@ -571,7 +571,7 @@ def _write_xml_sidecar(
 #         except Exception:
 #             pass
 
-
+from pathlib import PosixPath
 
 def nc_to_envi(
     img_file: str,
@@ -614,8 +614,9 @@ def nc_to_envi(
     os.makedirs(out_dir, exist_ok=True)
     os.makedirs(temp_dir, exist_ok=True)
 
+    print(img_file)
 
-    img_nc = nc.Dataset(img_file)
+    img_nc = nc.Dataset(PosixPath(img_file))
     print(f"Opened EMIT image dataset: {img_file}")
 
     for vname in ("radiance", "reflectance"):

@@ -87,8 +87,9 @@ def emit_quicklook_matplotlib(
         band = pct_stretch(band, *percentile)
         gray_disp = np.clip(band, 0, 1) ** gamma
 
-        if ax is None:
-            _, ax = plt.subplots(figsize=(7, 7))
+        # if ax is None:
+        #     _, ax = plt.subplots(figsize=(8, 8))
+        plt.figure(figsize=(8, 8))
         im = ax.imshow(gray_disp, cmap="gray", origin=origin)
         ax.set_title(f"EMIT ~{nm:.0f} nm")
         ax.set_axis_off()
@@ -117,7 +118,7 @@ def emit_quicklook_matplotlib(
     rgb_disp = np.clip(rgb, 0, 1) ** gamma
 
     if ax is None:
-        _, ax = plt.subplots(figsize=(7, 7))
+        _, ax = plt.subplots(figsize=(10, 7))
     ax.imshow(rgb_disp, origin=origin)
     ax.set_title(f"EMIT True Color ~ {nm_r:.0f}/{nm_g:.0f}/{nm_b:.0f} nm")
     ax.set_axis_off()
