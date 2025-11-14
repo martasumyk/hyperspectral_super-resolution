@@ -9,6 +9,10 @@ from rasterio.enums import Resampling
 from rasterio.plot import show
 from pathlib import Path
 
+import json
+from rasterio.mask import mask as rio_mask
+from shapely.geometry import mapping
+
 
 
 def point_buffer_bbox(lon: float, lat: float, meters: float):
@@ -110,3 +114,137 @@ def plot_s2_truecolor(paths, ax=None):
     ax.axis("off")
 
     return rgb
+
+
+from shapely.geometry import mapping, shape
+from rasterio.warp import transform_geom
+from rasterio.crs import CRS
+
+
+def reproject_geom(geom, dst_crs, src_crs: str = "EPSG:4326"):
+    """
+    Reproject a Shapely geometry from src_crs (default: WGS84) to dst_crs.
+
+    Parameters
+    ----------
+    geom : shapely.geometry.base.BaseGeometry
+        Geometry in src_crs coordinates (e.g. lon/lat in EPSG:4326).
+    dst_crs : str or rasterio.crs.CRS
+        Target CRS (e.g. ds.crs from a rasterio dataset).
+    src_crs : str, optional
+        Source CRS. Defaults to "EPSG:4326".
+
+    Returns
+    -------
+    shapely.geometry.base.BaseGeometry
+        Geometry reprojected into dst_crs.
+    """
+    # Allow passing rasterio CRS object directly
+    if isinstance(dst_crs, CRS):
+        dst_crs = dst_crs.to_string()
+
+    geojson = mapping(geom)  # shapely → GeoJSON-like dict
+    new_geojson = transform_geom(src_crs, dst_crs, geojson)
+    return shape(new_geojson)
+
+def _save_roi_from_asset(href: str, roi_geom_wgs84, out_path: Path) -> Path:
+    """Read only ROI from a remote S2 asset and save to out_path."""
+    with rasterio.open(href) as src:
+        roi_proj = reproject_geom(roi_geom_wgs84, src.crs)
+        out_image, out_transform = rio_mask(
+            src,
+            [mapping(roi_proj)],
+            crop=True
+        )
+
+        meta = src.meta.copy()
+        meta.update(
+            {
+                "height": out_image.shape[1],
+                "width": out_image.shape[2],
+                "transform": out_transform,
+            }
+        )
+
+        with rasterio.open(out_path, "w", **meta) as dst:
+            dst.write(out_image)
+
+    return out_path
+
+
+def download_s2_truecolor_roi(item, roi_geom_wgs84, out_dir: Path | str = None) -> Path:
+    """
+    Download ONLY the ROI part of a Sentinel-2 truecolor image.
+
+    - If 'visual' asset is present: save cropped visual as {item.id}_visual_roi.tif
+    - Else: crop B04/B03/B02 and stack into an RGB GeoTIFF {item.id}_RGB_roi.tif
+
+    Returns path to the ROI GeoTIFF.
+    """
+    if out_dir is None:
+        out_dir = S2_DIR
+    out_dir = Path(out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    assets = item.assets
+
+    # 1) Prefer precomputed truecolor ('visual')
+    if "visual" in assets:
+        href = assets["visual"].href
+        out = out_dir / f"{item.id}_visual_roi.tif"
+        if not out.exists():
+            _save_roi_from_asset(href, roi_geom_wgs84, out)
+        return out
+
+    # 2) Otherwise build ROI RGB from B04/B03/B02
+    bands = ("B04", "B03", "B02")
+    hrefs = []
+    for b in bands:
+        if b not in assets:
+            raise RuntimeError(f"Item {item.id} missing band {b} for truecolor RGB.")
+        hrefs.append(assets[b].href)
+
+    out = out_dir / f"{item.id}_RGB_roi.tif"
+    if out.exists():
+        return out
+
+    # Use first band to define ROI extent/grid
+    first_href = hrefs[0]
+    with rasterio.open(first_href) as src0:
+        roi_proj = reproject_geom(roi_geom_wgs84, src0.crs)
+        img0, out_transform = rio_mask(
+            src0,
+            [mapping(roi_proj)],
+            crop=True
+        )
+        meta = src0.meta.copy()
+
+    # Allocate array for all 3 bands
+    h, w = img0.shape[1], img0.shape[2]
+    data = np.empty((len(bands), h, w), dtype=img0.dtype)
+    data[0] = img0[0]
+
+    # Read remaining bands with same ROI
+    for i, href in enumerate(hrefs[1:], start=1):
+        with rasterio.open(href) as src:
+            roi_proj = reproject_geom(roi_geom_wgs84, src.crs)
+            img, _ = rio_mask(
+                src,
+                [mapping(roi_proj)],
+                crop=True
+            )
+            data[i] = img[0]
+
+    meta.update(
+        {
+            "count": len(bands),
+            "height": h,
+            "width": w,
+            "transform": out_transform,
+        }
+    )
+
+    with rasterio.open(out, "w", **meta) as dst:
+        dst.write(data)
+
+    return out
