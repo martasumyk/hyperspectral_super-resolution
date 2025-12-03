@@ -14,6 +14,34 @@ import earthaccess as ea
 EMIT_SHORT_NAME = "EMITL2ARFL"  # L2A Reflectance
 
 
+def _emit_item_date(item) -> date:
+    """Extract UTC date from an EMIT search item."""
+    try:
+        iso = item["umm"]["ProviderDates"][0]["Date"]
+    except Exception:
+        iso = item.get("datetime") or item.get("start_time")
+    dt_utc = datetime.fromisoformat(str(iso).replace("Z", "+00:00")).astimezone(timezone.utc)
+    return dt_utc.date()
+
+def _emit_cloud_pct(item) -> float:
+    try:
+        return float(item["umm"].get("CloudCover"))
+    except Exception:
+        return float("inf")
+
+def find_emit_candidates(lon: float, lat: float):
+    """Search EMIT around the location and within DATE_START..DATE_END."""
+    login(persist=True)
+    roi_bbox = point_buffer_bbox(lon, lat, SEARCH_BUFFER_M)
+    items = search(
+        point=(lon, lat),
+        bbox=roi_bbox,
+        start=DATE_START.isoformat(),
+        end=DATE_END.isoformat(),
+    )
+    return list(items)
+
+
 def login(persist: bool = True) -> None:
     ea.login(persist=persist)
 

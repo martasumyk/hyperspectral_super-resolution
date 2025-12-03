@@ -1,7 +1,8 @@
 import pyproj
 from shapely.geometry import Point, box, Polygon
 from datetime import datetime, timezone
-import requests, tqdm
+import requests
+from tqdm import tqdm
 import matplotlib.pyplot as plt
 import numpy as np
 import rasterio
