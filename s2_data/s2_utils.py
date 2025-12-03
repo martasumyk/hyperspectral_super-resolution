@@ -99,7 +99,7 @@ def download_asset(href, out_path):
     r.raise_for_status()
     total = int(r.headers.get("content-length", 0))
     with open(out_path, "wb") as f, \
-         tqdm.tqdm(total=total, unit="B", unit_scale=True, desc=out_path.name) as pbar:
+        tqdm(total=total, unit="B", unit_scale=True, desc=out_path.name) as pbar:
         for chunk in r.iter_content(chunk_size=2**20):
             if chunk:
                 f.write(chunk)
