@@ -242,3 +242,135 @@ def download_reflectance_roi(
     return out_paths
 
 
+def _emit_item_date(item) -> date:
+    """Extract UTC date from an EMIT search item."""
+    try:
+        iso = item["umm"]["ProviderDates"][0]["Date"]
+    except Exception:
+        iso = item.get("datetime") or item.get("start_time")
+    dt_utc = datetime.fromisoformat(str(iso).replace("Z", "+00:00")).astimezone(timezone.utc)
+    return dt_utc.date()
+
+def _emit_cloud_pct(item) -> float:
+    try:
+        return float(item["umm"].get("CloudCover"))
+    except Exception:
+        return float("inf")
+
+def find_emit_candidates(lon: float, lat: float):
+    """Search EMIT around the location and within DATE_START..DATE_END."""
+    login(persist=True)
+    roi_bbox = point_buffer_bbox(lon, lat, SEARCH_BUFFER_M)
+    items = search(
+        point=(lon, lat),
+        bbox=roi_bbox,
+        start=DATE_START.isoformat(),
+        end=DATE_END.isoformat(),
+    )
+    return list(items)
+
+def choose_best_emit_per_date(items):
+    """Group by date and keep least-cloudy EMIT per date; apply optional max cloud threshold."""
+    by_date = {}
+    for it in items:
+        d = _emit_item_date(it)
+        cur = by_date.get(d)
+        if cur is None or _emit_cloud_pct(it) < _emit_cloud_pct(cur):
+            by_date[d] = it
+    if MAX_EMIT_CLOUD_PCT is not None:
+        by_date = {d: it for d, it in by_date.items() if _emit_cloud_pct(it) <= MAX_EMIT_CLOUD_PCT}
+    return {d.isoformat(): it for d, it in by_date.items()}
+
+
+def download_s2_truecolor(item) -> Path:
+    """Download S2 visual (true color) if available; else save B04/B03/B02 and return JSON list."""
+    assets = item.assets
+    if "visual" in assets:
+        href = assets["visual"].href
+        out = S2_DIR / f"{item.id}_visual.tif"
+        if not out.exists():
+            download_asset(href, out)
+        return out
+    band_paths = []
+    for b in ("B04", "B03", "B02"):
+        if b in assets:
+            href = assets[b].href
+            out = S2_DIR / f"{item.id}_{b}.tif"
+            if not out.exists():
+                download_asset(href, out)
+            band_paths.append(str(out))
+    out_json = S2_DIR / f"{item.id}_RGB_bands.json"
+    out_json.write_text(json.dumps(band_paths, indent=2))
+    return out_json
+
+
+def convert_emit_nc_to_envi(emit_nc_paths, s2_visual_path, out_dir, emit_obs_nc=None) -> Path:
+    """
+    Run nc_to_envi and return the path to the RFL ENVI .bin cube.
+
+    emit_nc_paths : list[Path] or similar from download_reflectance
+    """
+    out_dir = Path(out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    tmp_dir = out_dir / "tmp"
+    tmp_dir.mkdir(parents=True, exist_ok=True)
+
+    print(emit_nc_paths[0])
+    nc_to_envi(
+        img_file=str(emit_nc_paths[0]),
+        out_dir=str(out_dir),
+        temp_dir=str(tmp_dir),
+        obs_file=str(emit_obs_nc) if emit_obs_nc else None,
+        export_loc=True,
+        crid="000",
+        s2_tif_path=str(s2_visual_path),
+        match_res=False,
+        write_xml=False,
+    )
+
+    # hytools usually writes into out_dir / "emit_out"
+    emit_out = out_dir / "emit_out"
+    search_root = emit_out if emit_out.exists() else out_dir
+
+    # Look for the reflectance cube
+    for pattern in ("*RFL*000.bin", "*RFL*.bin", "*.bin"):
+        bins = sorted(search_root.glob(pattern))
+        if bins:
+            print("Picked ENVI cube:", bins[0])
+            return bins[0]
+
+    raise FileNotFoundError(f"ENVI .bin not found under {search_root}")
+
+
+
+def visualize_pair(date_iso: str, s2_path: Path, envi_bin_path: Path) -> Path:
+    fig = plt.figure(figsize=(12, 5))
+    ax1 = fig.add_subplot(1, 2, 1)
+    ax2 = fig.add_subplot(1, 2, 2)
+
+    # --- S2 side ---
+    try:
+        # s2_path can be a visual.tif or a JSON with band paths
+        if isinstance(s2_path, Path) and s2_path.suffix.lower() == ".json":
+            s2_paths = json.loads(s2_path.read_text())
+        else:
+            s2_paths = [str(s2_path)]
+
+        plot_s2_truecolor(s2_paths, ax=ax1)
+    except Exception as e:
+        ax1.text(0.5, 0.5, f"S2 plot failed: {e}", ha="center", va="center")
+        ax1.set_axis_off()
+
+    # --- EMIT side ---
+    try:
+        show_emit_rgb_from_envi_ax(envi_bin_path, ax=ax2, gamma=1.0)
+    except Exception as e:
+        ax2.text(0.5, 0.5, f"EMIT plot failed: {e}", ha="center", va="center")
+        ax2.set_axis_off()
+
+    out_png = FIG_DIR / f"pair_{date_iso}.png"
+    fig.tight_layout()
+    fig.savefig(out_png, dpi=150)
+    plt.close(fig)
+    return out_png
+
