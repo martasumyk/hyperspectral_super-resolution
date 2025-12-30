@@ -288,3 +288,24 @@ def download_s2_truecolor_roi(item, roi_geom_wgs84, out_dir: Path | str = None) 
         dst.write(data)
 
     return out
+
+def download_s2_truecolor(item, s2_dir) -> Path:
+    """Download S2 visual (true color) if available; else save B04/B03/B02 and return JSON list."""
+    assets = item.assets
+    if "visual" in assets:
+        href = assets["visual"].href
+        out = s2_dir / f"{item.id}_visual.tif"
+        if not out.exists():
+            download_asset(href, out)
+        return out
+    band_paths = []
+    for b in ("B04", "B03", "B02"):
+        if b in assets:
+            href = assets[b].href
+            out = s2_dir / f"{item.id}_{b}.tif"
+            if not out.exists():
+                download_asset(href, out)
+            band_paths.append(str(out))
+    out_json = s2_dir / f"{item.id}_RGB_bands.json"
+    out_json.write_text(json.dumps(band_paths, indent=2))
+    return out_json
