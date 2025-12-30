@@ -198,6 +198,26 @@ def _write_xml_sidecar(
     out_xml = os.path.splitext(out_bin_path)[0] + ".xml"
     _pretty_write_xml(root, out_xml)
 
+def get_attr(ds, name):
+    if hasattr(ds, "ncattrs") and name in ds.ncattrs():
+        v = ds.getncattr(name)
+    elif hasattr(ds, "attrs") and name in ds.attrs:
+        v = ds.attrs[name]
+    else:
+        raise KeyError(name)
+    if isinstance(v, (bytes, bytearray)):
+        v = v.decode("utf-8")
+    return v
+
+def open_any_nc(path):
+    path = str(Path(path).expanduser().resolve())
+    try:
+        import netCDF4 as nc
+        return nc.Dataset(path, "r"), "netCDF4"
+    except Exception:
+        import h5netcdf
+        return h5netcdf.File(path, "r"), "h5netcdf"
+    
 def nc_to_envi(
     img_file: str,
     out_dir: str,
@@ -255,6 +275,8 @@ def nc_to_envi(
 
     print("Opened with:", backend)
 
+
+
     for vname in ("radiance", "reflectance"):
         if vname in img_nc.variables:
             var = img_nc.variables[vname]
@@ -268,25 +290,28 @@ def nc_to_envi(
 
     # Product & data
     if "radiance" in img_nc.variables.keys():
-        data = img_nc["radiance"]
+        data = img_nc.variables["radiance"]
         product = "L1B_RDN"
         description = "Radiance micro-watts/cm^2/nm/sr"
     elif "reflectance" in img_nc.variables.keys():
-        data = img_nc["reflectance"]
+        data = img_nc.variables["reflectance"]
         product = "L2A_RFL"
         description = "Reflectance (unitless)"
     else:
         print("Unrecognized input image dataset (expected 'radiance' or 'reflectance').")
         return
 
-    fwhm = img_nc["sensor_band_parameters"]["fwhm"][:].data
-    waves = img_nc["sensor_band_parameters"]["wavelengths"][:].data
-
+    sbp = img_nc.groups["sensor_band_parameters"]
+    fwhm  = np.asarray(sbp.variables["fwhm"][:])
+    waves = np.asarray(sbp.variables["wavelengths"][:])
     # Geotransform/GLT
-    gt = np.array(img_nc.__dict__["geotransform"])
-    glt = np.zeros(list(img_nc.groups["location"]["glt_x"].shape) + [2], dtype=np.int32)
-    glt[..., 0] = np.array(img_nc.groups["location"]["glt_x"])
-    glt[..., 1] = np.array(img_nc.groups["location"]["glt_y"])
+    gt = np.array(get_attr(img_nc, "geotransform"))
+    loc = img_nc.groups["location"]
+    glt_x = np.asarray(loc.variables["glt_x"][:])
+    glt_y = np.asarray(loc.variables["glt_y"][:])
+    glt = np.zeros(list(glt_x.shape) + [2], dtype=np.int32)
+    glt[..., 0] = glt_x
+    glt[..., 1] = glt_y
     valid_glt = np.all(glt != 0, axis=-1)
     glt[valid_glt] -= 1
 
@@ -301,16 +326,18 @@ def nc_to_envi(
     ]
 
     # Extents & time
-    latitude = np.array(img_nc.groups["location"]["lat"])
-    longitude = np.array(img_nc.groups["location"]["lon"])
+    latitude  = np.asarray(loc.variables["lat"][:])
+    longitude = np.asarray(loc.variables["lon"][:])
 
     corner_1 = [float(longitude[0, 0]), float(latitude[0, 0])]
     corner_2 = [float(longitude[0, -1]), float(latitude[0, -1])]
     corner_3 = [float(longitude[-1, -1]), float(latitude[-1, -1])]
     corner_4 = [float(longitude[-1, 0]), float(latitude[-1, 0])]
 
-    start_time = dt.datetime.strptime(img_nc.time_coverage_start, "%Y-%m-%dT%H:%M:%S+0000")
-    end_time = dt.datetime.strptime(img_nc.time_coverage_end, "%Y-%m-%dT%H:%M:%S+0000")
+    t0 = get_attr(img_nc, "time_coverage_start")
+    t1 = get_attr(img_nc, "time_coverage_end")
+    start_time = dt.datetime.strptime(str(t0), "%Y-%m-%dT%H:%M:%S+0000")
+    end_time   = dt.datetime.strptime(str(t1), "%Y-%m-%dT%H:%M:%S+0000")
 
     # Prepare unprojected ENVI (GCS) container to warp from
     data_header = ht.io.envi_header_dict()
@@ -363,10 +390,17 @@ def nc_to_envi(
     #     out_crs = "EPSG:32%s%02d" % (epsg_dir, zone)
     #     out_epsg_int = int(out_crs.split(":")[1])
     #     crs_wkt = rasterio.crs.CRS.from_epsg(out_epsg_int).to_wkt()
+    if not out_crs:
+        raise ValueError("out_crs is None. Provide s2_tif_path or enable epsg/UTM fallback.")
 
-    # Warp data
     print(f"Projecting data to {out_crs} {'(match S2 res)' if match_res else '(60 m)'}")
     data_utm = f'{out_dir}/SISTER_EMIT_{product}_{start_time.strftime("%Y%m%dT%H%M%S")}_{crid}.bin'
+    cmd = f"gdalwarp -overwrite -t_srs {out_crs} {tr_opt} -r near -of ENVI {data_gcs} {data_utm}"
+    ret = os.system(cmd)
+    if ret != 0:
+        raise RuntimeError(f"gdalwarp failed with code {ret}: {cmd}")
+
+    # Warp data
     os.system(f"gdalwarp -overwrite -t_srs {out_crs} {tr_opt} -r near -of ENVI {data_gcs} {data_utm}")
 
     # Fix header
@@ -484,7 +518,7 @@ def nc_to_envi(
     # OBS export
     if obs_file:
         print("Exporting EMIT observation dataset")
-        obs_nc = nc.Dataset(obs_file)
+        obs_nc, obs_backend = open_any_nc(obs_file)
 
         # ---- NEW: robust read of OBS cube ----
         try:
@@ -566,6 +600,10 @@ def nc_to_envi(
                 os.remove(xml)
             except Exception:
                 pass
+    try: 
+        img_nc.close()
+    except Exception: 
+        pass
 
 
 def convert_emit_nc_to_envi(emit_nc_paths, s2_visual_path, out_dir, emit_obs_nc=None) -> Path:
