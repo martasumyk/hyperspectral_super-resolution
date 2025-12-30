@@ -235,12 +235,16 @@ def nc_to_envi(
     write_xml : bool
         If True, write an XML sidecar with rich metadata next to each ENVI output
     """
+    import os
+    os.environ.setdefault("HDF5_USE_FILE_LOCKING", "FALSE")  # must be set before HDF5 loads
+    import netCDF4 as nc
     os.makedirs(out_dir, exist_ok=True)
     os.makedirs(temp_dir, exist_ok=True)
 
     print(img_file)
 
-    img_nc = nc.Dataset(PosixPath(img_file))
+    img_file = str(Path(img_file).expanduser().resolve())
+    img_nc = nc.Dataset(img_file, "r")
     print(f"Opened EMIT image dataset: {img_file}")
 
     for vname in ("radiance", "reflectance"):
