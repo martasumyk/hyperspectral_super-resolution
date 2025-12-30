@@ -6,6 +6,7 @@ from pathlib import PosixPath
 
 
 import netCDF4 as nc
+import h5netcdf
 import hytools as ht
 import numpy as np
 import rasterio
@@ -237,15 +238,22 @@ def nc_to_envi(
     """
     import os
     os.environ.setdefault("HDF5_USE_FILE_LOCKING", "FALSE")  # must be set before HDF5 loads
-    import netCDF4 as nc
     os.makedirs(out_dir, exist_ok=True)
     os.makedirs(temp_dir, exist_ok=True)
 
     print(img_file)
 
     img_file = str(Path(img_file).expanduser().resolve())
-    img_nc = nc.Dataset(img_file, "r")
-    print(f"Opened EMIT image dataset: {img_file}")
+    try:
+        import netCDF4 as nc
+        img_nc = nc.Dataset(img_file, "r")
+        backend = "netCDF4"
+    except OSError as e:
+        import h5netcdf
+        img_nc = h5netcdf.File(img_file, "r")
+        backend = "h5netcdf"
+
+    print("Opened with:", backend)
 
     for vname in ("radiance", "reflectance"):
         if vname in img_nc.variables:
