@@ -180,3 +180,5 @@ def choose_best_emit_per_date(items, max_cloud_pct = 50):
     if max_cloud_pct is not None:
         by_date = {d: it for d, it in by_date.items() if _emit_cloud_pct(it) <= max_cloud_pct}
     return {d.isoformat(): it for d, it in by_date.items()}
+
+
