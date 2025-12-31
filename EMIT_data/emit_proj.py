@@ -358,14 +358,14 @@ def nc_to_envi(
         ts = start_time.strftime("%Y%m%dT%H%M%S")
         suffix = f"_{tag}" if tag else ""
 
-        data_utm = out_dir_p / f"EMIT_{product}_{ts}_{crid}{suffix}.bin"
+        data_utm = out_dir_p / f"{tag}.bin"
         data_hdr = data_utm.with_suffix(".hdr")
 
-        loc_utm = out_dir_p / f"EMIT_{product}_{ts}_{crid}{suffix}_LOC.bin"
-        loc_hdr = loc_utm.with_suffix(".hdr")
+        loc_utm  = out_dir_p / f"{tag}_LOC.bin"
+        loc_hdr  = loc_utm.with_suffix(".hdr")
 
-        obs_utm = out_dir_p / f"EMIT_{product}_{ts}_{crid}{suffix}_OBS.bin"
-        obs_hdr = obs_utm.with_suffix(".hdr")
+        obs_utm  = out_dir_p / f"{tag}_OBS.bin"
+        obs_hdr  = obs_utm.with_suffix(".hdr")
 
         need_data = overwrite or not (data_utm.exists() and data_hdr.exists())
         need_loc  = export_loc and (overwrite or not (loc_utm.exists() and loc_hdr.exists()))
@@ -403,7 +403,7 @@ def nc_to_envi(
             data_header["interleave"] = "bil"
             data_header["map info"] = map_info
 
-            data_gcs = str(temp_dir_p / f"data_gcs_{product}_{ts}_{crid}{suffix}")
+            data_gcs = str(temp_dir_p / f"data_gcs_{tag}")
             writer = ht.io.WriteENVI(data_gcs, data_header)
             data_prj = np.full((glt.shape[0], glt.shape[1]), NO_DATA_VALUE, dtype=np.float32)
 
@@ -473,7 +473,7 @@ def nc_to_envi(
             loc_header0["interleave"] = "bil"
             loc_header0["map info"] = map_info
 
-            loc_gcs  = str(temp_dir_p / f"loc_gcs_{product}_{ts}_{crid}{suffix}")
+            loc_gcs  = str(temp_dir_p / f"loc_gcs_{tag}")
             writer = ht.io.WriteENVI(loc_gcs, loc_header0)
 
             loc_vars = img_nc.groups["location"].variables
@@ -548,7 +548,7 @@ def nc_to_envi(
                 obs_header0["interleave"] = "bil"
                 obs_header0["map info"] = map_info
 
-                obs_gcs  = str(temp_dir_p / f"obs_gcs_{product}_{ts}_{crid}{suffix}")
+                obs_gcs  = str(temp_dir_p / f"obs_gcs_{tag}")
                 writer = ht.io.WriteENVI(obs_gcs, obs_header0)
 
                 obs_band = np.full((glt.shape[0], glt.shape[1]), NO_DATA_VALUE, dtype=np.float32)
