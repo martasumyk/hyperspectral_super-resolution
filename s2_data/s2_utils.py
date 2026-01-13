@@ -20,7 +20,7 @@ from s2_data.cloud_utils import (
 
 
 def find_best_s2_for_date(date_iso: str, lon: float, lat: float,
-                          s2_collection, search_buffer, s2_api, s2_dir):
+                          s2_collection, search_buffer, s2_api):
     """For the SAME date, search S2 in ROI; return least-cloudy item + cloud fraction using SCL."""
     bbox_poly = point_buffer_bbox(lon, lat, search_buffer)
     roi_geom = box(*bbox_poly.bounds)
@@ -36,7 +36,7 @@ def find_best_s2_for_date(date_iso: str, lon: float, lat: float,
     best_frac = None
 
     for item in tqdm(items, desc=f"S2 cloud check {date_iso}"):
-        key = best_asset_key(item.assets, ["scl", "scl-jp2"])
+        key = best_asset_key(item.assets, "scl")
         if key is None:
             continue
 
