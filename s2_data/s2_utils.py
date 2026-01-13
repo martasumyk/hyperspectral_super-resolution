@@ -309,3 +309,141 @@ def download_s2_truecolor(item, s2_dir) -> Path:
     out_json = s2_dir / f"{item.id}_RGB_bands.json"
     out_json.write_text(json.dumps(band_paths, indent=2))
     return out_json
+
+
+import numpy as np
+from pathlib import Path
+import rasterio
+from rasterio.warp import reproject
+from rasterio.enums import Resampling
+
+def _href_suffix(href: str) -> str:
+    # strip query params if present
+    base = href.split("?", 1)[0]
+    suf = Path(base).suffix.lower()
+    return suf if suf else ".tif"
+
+def _download_band(item, key: str, out_dir: Path, stem: str) -> Path:
+    href = item.assets[key].href
+    ext = _href_suffix(href)
+    out = out_dir / f"{stem}{ext}"
+    if not out.exists():
+        download_asset(href, out)
+    return out
+
+def download_s2_spectral_stack(item, s2_dir: Path) -> Path:
+    """
+    For STAC items with assets named like:
+      blue, green, red, nir, rededge1/2/3, swir16, swir22, nir08 (optional)
+    Create a single 10-band GeoTIFF on the 10m grid.
+    """
+    s2_dir = Path(s2_dir)
+    s2_dir.mkdir(parents=True, exist_ok=True)
+
+    assets = item.assets
+    required = ["blue", "green", "red", "nir", "rededge1", "rededge2", "rededge3", "swir16", "swir22"]
+    missing = [k for k in required if k not in assets]
+    if missing:
+        raise ValueError(f"Missing required assets: {missing}. Available: {list(assets.keys())}")
+
+    # Download core bands
+    paths = {}
+    paths["blue"]     = _download_band(item, "blue",     s2_dir, f"{item.id}_blue")
+    paths["green"]    = _download_band(item, "green",    s2_dir, f"{item.id}_green")
+    paths["red"]      = _download_band(item, "red",      s2_dir, f"{item.id}_red")
+    paths["nir"]      = _download_band(item, "nir",      s2_dir, f"{item.id}_nir")
+    paths["rededge1"] = _download_band(item, "rededge1", s2_dir, f"{item.id}_rededge1")
+    paths["rededge2"] = _download_band(item, "rededge2", s2_dir, f"{item.id}_rededge2")
+    paths["rededge3"] = _download_band(item, "rededge3", s2_dir, f"{item.id}_rededge3")
+    paths["swir16"]   = _download_band(item, "swir16",   s2_dir, f"{item.id}_swir16")
+    paths["swir22"]   = _download_band(item, "swir22",   s2_dir, f"{item.id}_swir22")
+
+    # Optional B8A-ish band: nir08 (many catalogs provide it)
+    nir08_path = None
+    if "nir08" in assets:
+        nir08_path = _download_band(item, "nir08", s2_dir, f"{item.id}_nir08")
+
+    out_stack = s2_dir / f"{item.id}_S2_10band_10m.tif"
+    if out_stack.exists():
+        return out_stack
+
+    # Reference grid = blue (10m)
+    with rasterio.open(paths["blue"]) as ref:
+        H, W = ref.height, ref.width
+        ref_transform = ref.transform
+        ref_crs = ref.crs
+        out_dtype = ref.dtypes[0]
+
+    def warp_to_ref(src_path: Path, resampling):
+        with rasterio.open(src_path) as src:
+            dst = np.zeros((H, W), dtype=out_dtype)
+            reproject(
+                source=rasterio.band(src, 1),
+                destination=dst,
+                src_transform=src.transform,
+                src_crs=src.crs,
+                dst_transform=ref_transform,
+                dst_crs=ref_crs,
+                resampling=resampling,
+            )
+            return dst
+
+    # Decide if nir08 exists and is different resolution than nir (so we can treat it like B8A)
+    include_nir08 = False
+    if nir08_path is not None:
+        with rasterio.open(paths["nir"]) as ds_nir, rasterio.open(nir08_path) as ds_nir08:
+            nir_res   = abs(ds_nir.transform.a)
+            nir08_res = abs(ds_nir08.transform.a)
+        # Common pattern: nir ~10m, nir08 ~20m
+        include_nir08 = (nir08_res != nir_res)
+
+    # Build band list in the order you want in the stack
+    # (names are for your metadata / sanity checks)
+    band_order = [
+        ("B02_blue",     paths["blue"],     Resampling.nearest),
+        ("B03_green",    paths["green"],    Resampling.nearest),
+        ("B04_red",      paths["red"],      Resampling.nearest),
+        ("B08_nir",      paths["nir"],      Resampling.nearest),
+        ("B05_rededge1", paths["rededge1"], Resampling.bilinear),
+        ("B06_rededge2", paths["rededge2"], Resampling.bilinear),
+        ("B07_rededge3", paths["rededge3"], Resampling.bilinear),
+    ]
+    if include_nir08:
+        band_order.append(("B8A_nir08", nir08_path, Resampling.bilinear))
+    else:
+        # If nir08 isn't usable, still keep 10 bands by duplicating nir as a placeholder is NOT recommended.
+        # Better: only output 9 bands if nir08 isn't distinct.
+        pass
+
+    band_order += [
+        ("B11_swir16", paths["swir16"], Resampling.bilinear),
+        ("B12_swir22", paths["swir22"], Resampling.bilinear),
+    ]
+
+    # If nir08 isn't distinct, you'll end up with 9 bands; warn early
+    if not include_nir08:
+        print("WARNING: 'nir08' not included (missing or same resolution as 'nir'). Output will have 9 bands.")
+
+    stack = np.stack([warp_to_ref(p, rs) for (_, p, rs) in band_order], axis=0)
+
+    # Write GeoTIFF
+    with rasterio.open(paths["blue"]) as ref:
+        profile = ref.profile.copy()
+    profile.update(
+        driver="GTiff",
+        height=H,
+        width=W,
+        count=stack.shape[0],
+        dtype=stack.dtype,
+        compress="DEFLATE",
+        predictor=2,
+        tiled=True,
+        BIGTIFF="IF_SAFER",
+    )
+
+    with rasterio.open(out_stack, "w", **profile) as dst:
+        dst.write(stack)
+        for i, (name, _, _) in enumerate(band_order, start=1):
+            dst.set_band_description(i, name)
+
+    return out_stack
