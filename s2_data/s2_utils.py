@@ -350,7 +350,6 @@ def download_s2_spectral_stack(item, s2_dir: Path) -> Path:
     if missing:
         raise ValueError(f"Missing required assets: {missing}. Available: {list(assets.keys())}")
 
-    # Download core bands
     paths = {}
     paths["blue"]     = _download_band(item, "blue",     s2_dir, f"{item.id}_blue")
     paths["green"]    = _download_band(item, "green",    s2_dir, f"{item.id}_green")
@@ -362,7 +361,6 @@ def download_s2_spectral_stack(item, s2_dir: Path) -> Path:
     paths["swir16"]   = _download_band(item, "swir16",   s2_dir, f"{item.id}_swir16")
     paths["swir22"]   = _download_band(item, "swir22",   s2_dir, f"{item.id}_swir22")
 
-    # Optional B8A-ish band: nir08 (many catalogs provide it)
     nir08_path = None
     if "nir08" in assets:
         nir08_path = _download_band(item, "nir08", s2_dir, f"{item.id}_nir08")
@@ -392,17 +390,13 @@ def download_s2_spectral_stack(item, s2_dir: Path) -> Path:
             )
             return dst
 
-    # Decide if nir08 exists and is different resolution than nir (so we can treat it like B8A)
     include_nir08 = False
     if nir08_path is not None:
         with rasterio.open(paths["nir"]) as ds_nir, rasterio.open(nir08_path) as ds_nir08:
-            nir_res   = abs(ds_nir.transform.a)
+            nir_res = abs(ds_nir.transform.a)
             nir08_res = abs(ds_nir08.transform.a)
-        # Common pattern: nir ~10m, nir08 ~20m
         include_nir08 = (nir08_res != nir_res)
 
-    # Build band list in the order you want in the stack
-    # (names are for your metadata / sanity checks)
     band_order = [
         ("B02_blue",     paths["blue"],     Resampling.nearest),
         ("B03_green",    paths["green"],    Resampling.nearest),

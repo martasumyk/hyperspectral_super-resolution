@@ -229,9 +229,7 @@ def nc_to_envi(
     temp_dir: str,
     obs_file: str | None = None,
     export_loc: bool = False,
-    crid: str = "000",
     s2_tif_path: str | None = None,
-    epsg: int | str | None = None,
     match_res: bool = False,
     write_xml: bool = True,
     *,
@@ -312,7 +310,7 @@ def nc_to_envi(
         valid_glt = np.all(glt != 0, axis=-1)
         glt[valid_glt] -= 1
 
-        # ENVI header 'map info' as list (Geographic, degrees)
+        # ENVI header 'map info' as list
         map_info = [
             "Geographic Lat/Lon",
             1, 1,
@@ -348,8 +346,12 @@ def nc_to_envi(
                 out_crs = s2_crs.to_string()
                 out_epsg_int = s2_crs.to_epsg()
                 crs_wkt = s2_crs.to_wkt()
+
+                s2_bounds = src.bounds  # left, bottom, right, top
+                s2_res = (abs(float(src.res[0])), abs(float(src.res[1])))
+
                 if match_res and src.res is not None:
-                    out_ps = (abs(float(src.res[0])), abs(float(src.res[1])))
+                    out_ps = s2_res
         if not out_crs:
             raise ValueError("out_crs is None. Provide s2_tif_path or enable epsg/UTM fallback.")
 
@@ -375,14 +377,37 @@ def nc_to_envi(
             print(f"All requested outputs already exist; skipping. Returning: {data_utm}")
             return data_utm
 
-        def _run_gdalwarp(src_path: str, dst_path: str):
-            cmd = ["gdalwarp"]
-            if overwrite:
-                cmd.append("-overwrite")
-            cmd += ["-t_srs", out_crs]
-            cmd += tr_args
-            cmd += ["-r", "near", "-of", "ENVI", src_path, dst_path]
-            subprocess.run(cmd, check=True)
+    def _run_gdalwarp(src_path: str, dst_path: str):
+        cmd = ["gdalwarp"]
+
+        if overwrite:
+            cmd.append("-overwrite")
+
+        # Target CRS
+        cmd += ["-t_srs", out_crs]
+
+        # Target resolution (you already control this via tr_args)
+        cmd += tr_args
+
+        # Force target extent to match S2 grid (this is what improves alignment)
+        if s2_bounds is not None:
+            cmd += [
+                "-te",
+                str(s2_bounds.left),
+                str(s2_bounds.bottom),
+                str(s2_bounds.right),
+                str(s2_bounds.top),
+                "-tap",  # snap extent to the -tr grid
+            ]
+
+        # Nodata handling (prevents nodata from being treated as real values)
+        cmd += ["-srcnodata", str(NO_DATA_VALUE), "-dstnodata", str(NO_DATA_VALUE)]
+
+        # Resampling + output format
+        cmd += ["-r", "near", "-of", "ENVI", src_path, dst_path]
+
+        subprocess.run(cmd, check=True)
+
         # ----------------------------------------------------------------
 
         # Precompute gather indices once (used by all exports)
@@ -623,7 +648,6 @@ def convert_emit_nc_to_envi(
     out_dir: Union[str, Path],
     emit_obs_nc: Optional[Union[str, Path]] = None,
     *,
-    crid: str = "000",
     export_loc: bool = True,
     overwrite: bool = False,
 ) -> Path:
@@ -651,7 +675,6 @@ def convert_emit_nc_to_envi(
         temp_dir=str(tmp_dir),
         obs_file=str(emit_obs_nc) if emit_obs_nc else None,
         export_loc=export_loc,
-        crid=crid,
         s2_tif_path=str(s2_visual_path),
         match_res=False,
         write_xml=False,

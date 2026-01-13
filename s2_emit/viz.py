@@ -5,6 +5,9 @@ import rasterio
 import matplotlib.pyplot as plt
 from typing import Tuple
 
+
+from rasterio.warp import transform
+
 def load_s2_rgb_u8(s2_path: str, bands=(1,2,3)) -> np.ndarray:
     """
     Loads a 3-band S2 RGB (uint8 or uint16 etc) and returns (H,W,3) array.
