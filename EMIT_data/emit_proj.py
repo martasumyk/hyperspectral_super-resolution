@@ -12,6 +12,7 @@ import numpy as np
 import rasterio
 from pathlib import Path
 from typing import Iterable, Optional, Union
+import math
 
 
 import subprocess
@@ -377,36 +378,41 @@ def nc_to_envi(
             print(f"All requested outputs already exist; skipping. Returning: {data_utm}")
             return data_utm
 
-    def _run_gdalwarp(src_path: str, dst_path: str):
-        cmd = ["gdalwarp"]
+        def _run_gdalwarp(src_path: str, dst_path: str):
+            if s2_bounds is None:
+                raise ValueError("s2_bounds is None. Need s2_tif_path to align output grid.")
 
-        if overwrite:
-            cmd.append("-overwrite")
+            xres, yres = 60.0, 60.0
 
-        # Target CRS
-        cmd += ["-t_srs", out_crs]
+            left, bottom, right, top = (
+                float(s2_bounds.left),
+                float(s2_bounds.bottom),
+                float(s2_bounds.right),
+                float(s2_bounds.top),
+            )
 
-        # Target resolution (you already control this via tr_args)
-        cmd += tr_args
+            # Anchor to S2 origin (top-left), and choose an integer number of 60m pixels.
+            cols = math.ceil((right - left) / xres)
+            rows = math.ceil((top - bottom) / yres)
 
-        # Force target extent to match S2 grid (this is what improves alignment)
-        if s2_bounds is not None:
-            cmd += [
-                "-te",
-                str(s2_bounds.left),
-                str(s2_bounds.bottom),
-                str(s2_bounds.right),
-                str(s2_bounds.top),
-                "-tap",  # snap extent to the -tr grid
-            ]
+            aligned_right = left + cols * xres
+            aligned_bottom = top - rows * yres
 
-        # Nodata handling (prevents nodata from being treated as real values)
-        cmd += ["-srcnodata", str(NO_DATA_VALUE), "-dstnodata", str(NO_DATA_VALUE)]
+            cmd = ["gdalwarp"]
+            if overwrite:
+                cmd.append("-overwrite")
 
-        # Resampling + output format
-        cmd += ["-r", "near", "-of", "ENVI", src_path, dst_path]
+            cmd += ["-t_srs", out_crs]                      # target CRS :contentReference[oaicite:6]{index=6}
+            cmd += ["-tr", str(xres), str(yres)]            # target pixel size :contentReference[oaicite:7]{index=7}
+            cmd += ["-te", str(left), str(aligned_bottom),  # target extent :contentReference[oaicite:8]{index=8}
+                        str(aligned_right), str(top)]
 
-        subprocess.run(cmd, check=True)
+            cmd += ["-srcnodata", str(NO_DATA_VALUE),       # nodata handling :contentReference[oaicite:9]{index=9}
+                    "-dstnodata", str(NO_DATA_VALUE)]
+
+            cmd += ["-r", "cubic", "-of", "ENVI", src_path, dst_path]  # nearest neighbor :contentReference[oaicite:10]{index=10}
+            subprocess.run(cmd, check=True)
+
 
         # ----------------------------------------------------------------
 
