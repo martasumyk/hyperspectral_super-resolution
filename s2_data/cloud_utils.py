@@ -31,30 +31,39 @@ SCL_NAMES = {
 CLOUD_CLASSES = {8, 9, 10, 11}
 
 def count_cloud_pixels(scl_href: str, roi_geom_wgs84):
-    """Return (#cloud_pixels, #total_valid_pixels) within ROI from an SCL raster (local file or URL)."""
-    with rasterio.open(scl_href) as ds:
-        # roi_geom_wgs84 is in EPSG:4326; reproject to the SCL raster CRS
-        roi_proj = reproject_geom(roi_geom_wgs84, ds.crs)
-        data, _ = rio_mask(ds, [mapping(roi_proj)], crop=True)
+    """Return (#cloud_pixels, #total_valid_pixels) within ROI from an SCL raster (URL or local)."""
+    # Force GDAL's HTTP random-access VFS for remote URLs.
+    vsi_href = scl_href
+    if scl_href.startswith("http://") or scl_href.startswith("https://"):
+        vsi_href = f"/vsicurl/{scl_href}"
 
-        scl = data[0]
+    with rasterio.Env(
+        GDAL_DISABLE_READDIR_ON_OPEN="EMPTY_DIR",
+        CPL_VSIL_CURL_ALLOWED_EXTENSIONS=".tif,.tiff",
+        VSI_CACHE=True,
+        VSI_CACHE_SIZE=50_000_000,
+    ):
+        with rasterio.open(vsi_href) as ds:
+            roi_proj = reproject_geom(roi_geom_wgs84, ds.crs)
+            data, _ = rio_mask(ds, [mapping(roi_proj)], crop=True)
 
-        valid = scl != 0
-        total = int(valid.sum())
-
-        # If you want cloud fraction only on valid pixels:
-        # clouds = int(np.isin(scl, list(CLOUD_CLASSES)) & valid).sum()
-        clouds = int(np.isin(scl, list(CLOUD_CLASSES)).sum())
-
-    return clouds, total
+            scl = data[0]
+            valid = scl != 0
+            total = int(valid.sum())
+            clouds = int(np.isin(scl, list(CLOUD_CLASSES)).sum())
+            return clouds, total
 
 
-def find_asset_key(assets, candidates):
-    """Return the first key from `candidates` that exists in assets (case-insensitive)."""
-    aset = {k.lower(): k for k in assets.keys()} 
-    for c in candidates:
-        if c.lower() in aset:
-            return aset[c.lower()]
+def best_asset_key(assets, base):
+    """
+    Prefer GeoTIFF/COG asset (e.g., 'scl') and fall back to JP2 (e.g., 'scl-jp2').
+    Returns the actual key in assets (case-preserving), or None.
+    """
+    aset = {k.lower(): k for k in assets.keys()}
+    for cand in (base, f"{base}-jp2"):
+        k = aset.get(cand.lower())
+        if k is not None:
+            return k
     return None
 
 ALIASES = {

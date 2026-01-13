@@ -15,36 +15,40 @@ from rasterio.mask import mask as rio_mask
 from shapely.geometry import mapping
 from pystac_client import Client
 from s2_data.cloud_utils import (
-    find_asset_key, reproject_geom, scl_metrics, count_cloud_pixels
+    best_asset_key, reproject_geom, scl_metrics, count_cloud_pixels
 )
 
 
-def find_best_s2_for_date(date_iso: str, lon: float, lat: float, s2_collection, search_buffer, s2_api, s2_dir):
+def find_best_s2_for_date(date_iso: str, lon: float, lat: float,
+                          s2_collection, search_buffer, s2_api, s2_dir):
     """For the SAME date, search S2 in ROI; return least-cloudy item + cloud fraction using SCL."""
-    bbox = point_buffer_bbox(lon, lat, search_buffer)
-    roi_geom = box(*bbox.bounds)
+    bbox_poly = point_buffer_bbox(lon, lat, search_buffer)
+    roi_geom = box(*bbox_poly.bounds)
+
     time_range = f"{date_iso}T00:00:00Z/{date_iso}T23:59:59Z"
     client = Client.open(s2_api)
-    search = client.search(collections=[s2_collection], datetime=time_range, bbox=bbox.bounds)
+    search = client.search(collections=[s2_collection], datetime=time_range, bbox=bbox_poly.bounds)
     items = list(search.get_items())
     if not items:
         return None, None
 
     best_item = None
     best_frac = None
+
     for item in tqdm(items, desc=f"S2 cloud check {date_iso}"):
-        key = find_asset_key(item.assets, ["scl", "scl-jp2"])
-        asset = item.assets[key]
-        url = asset.href
-        ext = Path(url).suffix or (".tif" if key == "scl" else ".jp2")
-        scl_path = s2_dir / f"{item.id}_SCL{ext}"
-        if not scl_path.exists():
-            download_asset(url, scl_path)
+        key = best_asset_key(item.assets, ["scl", "scl-jp2"])
+        if key is None:
+            continue
+
+        url = item.assets[key].href
+
+        # Strongly prefer GeoTIFF/Cog (usually 'scl'); JP2 often can't do efficient range reads.
+        if key.lower() == "scl-jp2":
+            continue  # or fallback to metadata-based cloud if you want
 
         try:
-            clouds, total = count_cloud_pixels(str(scl_path), roi_geom)
+            clouds, total = count_cloud_pixels(url, roi_geom)   # <-- URL, not local file
         except (rasterio.errors.RasterioIOError, ValueError):
-
             continue
 
         frac = (clouds / total) if total else 1.0
