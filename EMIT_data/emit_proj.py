@@ -14,6 +14,11 @@ from pathlib import Path
 from typing import Iterable, Optional, Union
 import math
 
+import json, shlex, subprocess
+from pathlib import Path
+
+import rasterio
+from rasterio.warp import transform_bounds
 
 import subprocess
 
@@ -224,6 +229,60 @@ def open_any_nc(path):
         return h5netcdf.File(path, "r"), "h5netcdf"
     
 
+
+def run_cmd(cmd: list[str], check=True) -> dict:
+    """Run a subprocess command and return a JSON-friendly record (with truncated stdout/stderr)."""
+    res = subprocess.run(cmd, text=True, capture_output=True)
+    rec = {
+        "cmd": cmd,
+        "cmd_str": shlex.join(cmd),
+        "returncode": res.returncode,
+        "stdout_tail": (res.stdout[-5000:] if res.stdout else ""),
+        "stderr_tail": (res.stderr[-5000:] if res.stderr else ""),
+    }
+    if check and res.returncode != 0:
+        raise subprocess.CalledProcessError(res.returncode, cmd, output=res.stdout, stderr=res.stderr)
+    return rec
+
+def _gdal_translate_to_tif(src_path: str, dst_tif: str, assign_epsg: str | None = None) -> dict:
+    cmd = ["gdal_translate", "-of", "GTiff"]
+    if assign_epsg:
+        cmd += ["-a_srs", assign_epsg]
+    cmd += [src_path, dst_tif]
+    return run_cmd(cmd, check=True)
+
+
+
+def raster_meta(path: str) -> dict:
+    """Reads CRS/bounds/shape/res from any GDAL-readable raster (GeoTIFF or ENVI)."""
+    p = Path(path)
+    if not p.exists():
+        return {"path": str(path), "exists": False}
+
+    with rasterio.open(str(p)) as ds:
+        b = ds.bounds
+        crs = ds.crs
+        out = {
+            "path": str(p),
+            "exists": True,
+            "driver": ds.driver,
+            "crs": crs.to_string() if crs else None,
+            "width": ds.width,
+            "height": ds.height,
+            "count": ds.count,
+            "res": [float(ds.res[0]), float(ds.res[1])] if ds.res else None,
+            "bounds": [float(b.left), float(b.bottom), float(b.right), float(b.top)],
+            "nodata": ds.nodata,
+        }
+        if crs:
+            out["bounds_wgs84"] = list(transform_bounds(
+                crs, "EPSG:4326", b.left, b.bottom, b.right, b.top, densify_pts=21
+            ))
+        return out
+
+
+
+
 def nc_to_envi(
     img_file: str,
     out_dir: str,
@@ -234,9 +293,12 @@ def nc_to_envi(
     match_res: bool = False,
     write_xml: bool = True,
     *,
-    overwrite: bool = False,      # NEW: if False, don't regenerate existing outputs
-    tag: str | None = None,       # NEW: disambiguate outputs for multiple tiles
-) -> Path:
+    overwrite: bool = False,
+    tag: str | None = None,
+    return_info: bool = False,
+    save_info_path: str | Path | None = None,
+    save_geotiffs: bool = True,
+) -> Path | tuple[Path, dict]:
     """
     Export EMIT L1B_RDN or L2A_RFL to ENVI and write XML sidecars.
 
@@ -246,6 +308,15 @@ def nc_to_envi(
     Returns:
       Path to the main projected ENVI cube (.bin)
     """
+    def _finalize_and_return(out_path: Path):
+        # Save info if requested
+        if save_info_path is not None:
+            p = Path(save_info_path)
+            p.parent.mkdir(parents=True, exist_ok=True)
+            p.write_text(json.dumps(info, indent=2, default=str))
+            info["saved_info_path"] = str(p)
+
+        return (out_path, info) if return_info else out_path
 
     os.environ.setdefault("HDF5_USE_FILE_LOCKING", "FALSE")
     os.makedirs(out_dir, exist_ok=True)
@@ -376,9 +447,39 @@ def nc_to_envi(
 
         if not (need_data or need_loc or need_obs):
             print(f"All requested outputs already exist; skipping. Returning: {data_utm}")
-            return data_utm
+            info["outputs"]["data_envi_bin"] = str(data_utm)
+            return _finalize_and_return(data_utm)
+        
+        info = {
+            "img_file": img_file,
+            "obs_file": str(obs_file) if obs_file else None,
+            "tag": tag,
+            "backend": backend,
+            "product": product,
+            "description": description,
+            "time": {
+                "start": start_time.strftime("%Y-%m-%dT%H:%M:%SZ"),
+                "end": end_time.strftime("%Y-%m-%dT%H:%M:%SZ"),
+            },
+            "out": {
+                "out_crs": out_crs,
+                "out_epsg": out_epsg_int,
+                "match_res": bool(match_res),
+                "pixel_size_m": list(out_ps) if match_res else [60.0, 60.0],
+                "nodata": NO_DATA_VALUE,
+                "resampling": "cubic",
+            },
+            "s2_align": {
+                "s2_tif_path": str(s2_tif_path) if s2_tif_path else None,
+                "s2_bounds": [float(s2_bounds.left), float(s2_bounds.bottom), float(s2_bounds.right), float(s2_bounds.top)] if s2_tif_path else None,
+            },
+            "commands": {},
+            "outputs": {},
+            "rasters": {},
+        }
 
-        def _run_gdalwarp(src_path: str, dst_path: str):
+
+        def _run_gdalwarp(src_path: str, dst_path: str) -> dict:
             if s2_bounds is None:
                 raise ValueError("s2_bounds is None. Need s2_tif_path to align output grid.")
 
@@ -391,7 +492,6 @@ def nc_to_envi(
                 float(s2_bounds.top),
             )
 
-            # Anchor to S2 origin (top-left), and choose an integer number of 60m pixels.
             cols = math.ceil((right - left) / xres)
             rows = math.ceil((top - bottom) / yres)
 
@@ -402,16 +502,25 @@ def nc_to_envi(
             if overwrite:
                 cmd.append("-overwrite")
 
-            cmd += ["-t_srs", out_crs]                      # target CRS :contentReference[oaicite:6]{index=6}
-            cmd += ["-tr", str(xres), str(yres)]            # target pixel size :contentReference[oaicite:7]{index=7}
-            cmd += ["-te", str(left), str(aligned_bottom),  # target extent :contentReference[oaicite:8]{index=8}
-                        str(aligned_right), str(top)]
+            cmd += ["-t_srs", out_crs]
+            cmd += ["-tr", str(xres), str(yres)]
+            cmd += ["-te", str(left), str(aligned_bottom), str(aligned_right), str(top)]
+            cmd += ["-srcnodata", str(NO_DATA_VALUE), "-dstnodata", str(NO_DATA_VALUE)]
+            cmd += ["-r", "cubic", "-of", "ENVI", src_path, dst_path]
 
-            cmd += ["-srcnodata", str(NO_DATA_VALUE),       # nodata handling :contentReference[oaicite:9]{index=9}
-                    "-dstnodata", str(NO_DATA_VALUE)]
+            rec = run_cmd(cmd, check=True)
+            rec["aligned_extent"] = {
+                "left": left,
+                "bottom": aligned_bottom,
+                "right": aligned_right,
+                "top": top,
+                "cols": int(cols),
+                "rows": int(rows),
+                "xres": xres,
+                "yres": yres,
+            }
+            return rec
 
-            cmd += ["-r", "cubic", "-of", "ENVI", src_path, dst_path]  # nearest neighbor :contentReference[oaicite:10]{index=10}
-            subprocess.run(cmd, check=True)
 
 
         # ----------------------------------------------------------------
@@ -444,8 +553,35 @@ def nc_to_envi(
                 writer.write_band(data_prj, band_num)
                 data_prj.fill(NO_DATA_VALUE)
 
+            geotiff_dir = out_dir_p / "geotiff"
+            geotiff_dir.mkdir(parents=True, exist_ok=True)
+
+            ortho_tif = geotiff_dir / f"{tag}_DATA_ortho_wgs84.tif"
+            utm_tif   = geotiff_dir / f"{tag}_DATA_warp_utm.tif"
+
+            # Save orthorectified GeoTIFF (this is your GLT-projected cube in Geographic Lat/Lon)
+            if save_geotiffs:
+                info["commands"]["gdal_translate_data_ortho"] = _gdal_translate_to_tif(
+                    data_gcs, str(ortho_tif), assign_epsg="EPSG:4326"
+                )
+                info["outputs"]["data_ortho_tif"] = str(ortho_tif)
+                info["rasters"]["data_ortho_tif"] = raster_meta(str(ortho_tif))
+
+
             print(f"Projecting data to {out_crs} {'(match S2 res)' if match_res else '(60 m)'} -> {data_utm}")
-            _run_gdalwarp(data_gcs, str(data_utm))
+            warp_rec = _run_gdalwarp(data_gcs, str(data_utm))
+            info["commands"]["gdalwarp_data"] = warp_rec
+            info["outputs"]["data_envi_bin"] = str(data_utm)
+            info["outputs"]["data_envi_hdr"] = str(data_hdr)
+            info["rasters"]["data_envi"] = raster_meta(str(data_utm))
+
+            if save_geotiffs:
+                info["commands"]["gdal_translate_data_utm"] = _gdal_translate_to_tif(
+                    str(data_utm), str(utm_tif)
+                )
+                info["outputs"]["data_utm_tif"] = str(utm_tif)
+                info["rasters"]["data_utm_tif"] = raster_meta(str(utm_tif))
+
 
             # Fix header
             data_header2 = ht.io.envi.parse_envi_header(str(data_hdr))
@@ -516,7 +652,19 @@ def nc_to_envi(
                 loc_band.fill(NO_DATA_VALUE)
 
             print(f"Projecting location datacube to {out_crs} {'(match S2 res)' if match_res else '(60 m)'} -> {loc_utm}")
-            _run_gdalwarp(loc_gcs, str(loc_utm))
+            
+            warp_rec = _run_gdalwarp(loc_gcs, str(loc_utm))
+            info["commands"]["gdalwarp_loc"] = warp_rec
+            info["outputs"]["loc_envi_bin"] = str(loc_utm)
+            info["outputs"]["loc_envi_hdr"] = str(loc_hdr)
+            info["rasters"]["loc_envi"] = raster_meta(str(loc_utm))
+
+            if save_geotiffs:
+                loc_tif = (out_dir_p / "geotiff" / f"{tag}_LOC_warp_utm.tif")
+                info["commands"]["gdal_translate_loc_utm"] = _gdal_translate_to_tif(str(loc_utm), str(loc_tif))
+                info["outputs"]["loc_utm_tif"] = str(loc_tif)
+                info["rasters"]["loc_utm_tif"] = raster_meta(str(loc_tif))
+
 
             loc_header2 = ht.io.envi.parse_envi_header(str(loc_hdr))
             loc_header2["band names"] = ["longitude", "latitude", "elevation"]
@@ -590,7 +738,18 @@ def nc_to_envi(
                     obs_band.fill(NO_DATA_VALUE)
 
                 print(f"Projecting observation datacube to {out_crs} {'(match S2 res)' if match_res else '(60 m)'} -> {obs_utm}")
-                _run_gdalwarp(obs_gcs, str(obs_utm))
+                warp_rec = _run_gdalwarp(obs_gcs, str(obs_utm))
+                info["commands"]["gdalwarp_obs"] = warp_rec
+                info["outputs"]["obs_envi_bin"] = str(obs_utm)
+                info["outputs"]["obs_envi_hdr"] = str(obs_hdr)
+                info["rasters"]["obs_envi"] = raster_meta(str(obs_utm))
+
+                if save_geotiffs:
+                    obs_tif = (out_dir_p / "geotiff" / f"{tag}_OBS_warp_utm.tif")
+                    info["commands"]["gdal_translate_obs_utm"] = _gdal_translate_to_tif(str(obs_utm), str(obs_tif))
+                    info["outputs"]["obs_utm_tif"] = str(obs_tif)
+                    info["rasters"]["obs_utm_tif"] = raster_meta(str(obs_tif))
+
 
                 obs_header2 = ht.io.envi.parse_envi_header(str(obs_hdr))
                 obs_header2["band names"] = obs_bandnames
@@ -639,7 +798,7 @@ def nc_to_envi(
                 except Exception:
                     pass
 
-        return data_utm
+        return _finalize_and_return(data_utm)
 
     finally:
         try:
@@ -656,7 +815,10 @@ def convert_emit_nc_to_envi(
     *,
     export_loc: bool = True,
     overwrite: bool = False,
-) -> Path:
+    return_info: bool = False,
+    save_info_path: str | Path | None = None,
+    save_geotiffs: bool = True,
+) -> Path | tuple[Path, dict]:
     """
     Convert EMIT netCDF to ENVI using nc_to_envi and return the main ENVI cube path (.bin).
 
@@ -675,8 +837,8 @@ def convert_emit_nc_to_envi(
     img_path = emit_nc_paths[0]
 
 
-    out_bin = nc_to_envi(
-        img_file = str(img_path),
+    result = nc_to_envi(
+        img_file=str(img_path),
         out_dir=str(out_dir),
         temp_dir=str(tmp_dir),
         obs_file=str(emit_obs_nc) if emit_obs_nc else None,
@@ -685,12 +847,17 @@ def convert_emit_nc_to_envi(
         match_res=False,
         write_xml=False,
         overwrite=overwrite,
+
+        return_info=return_info,
+        save_info_path=save_info_path,
+        save_geotiffs=save_geotiffs,
     )
 
-    out_bin = Path(out_bin)
+    out_bin, info = result if return_info else (Path(result), None)
+
     if not out_bin.exists():
         raise FileNotFoundError(f"nc_to_envi returned {out_bin}, but it does not exist")
     if not out_bin.with_suffix(".hdr").exists():
         raise FileNotFoundError(f"Missing ENVI header for {out_bin} (expected {out_bin.with_suffix('.hdr')})")
 
-    return out_bin
+    return (out_bin, info) if return_info else out_bin
