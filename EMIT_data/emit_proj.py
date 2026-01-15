@@ -244,12 +244,36 @@ def run_cmd(cmd: list[str], check=True) -> dict:
         raise subprocess.CalledProcessError(res.returncode, cmd, output=res.stdout, stderr=res.stderr)
     return rec
 
-def _gdal_translate_to_tif(src_path: str, dst_tif: str, assign_epsg: str | None = None) -> dict:
-    cmd = ["gdal_translate", "-of", "GTiff"]
+def export_uint16_deflate_geotiff(
+    src_path: str,
+    dst_tif: str,
+    *,
+    assign_epsg: str | None = None,
+    scale_mode: str = "none",   # "none" | "emit_reflectance_0_1"
+    nodata_uint16: int = 65535,
+    zlevel: int = 1,
+) -> dict:
+    cmd = ["gdal_translate", "-of", "GTiff",
+           "-ot", "UInt16",
+           "-co", "COMPRESS=DEFLATE",
+           "-co", f"ZLEVEL={int(zlevel)}",
+           "-co", "PREDICTOR=2",
+           "-co", "NUM_THREADS=ALL_CPUS",
+           "-co", "BIGTIFF=IF_SAFER"]
+
+    if scale_mode == "emit_reflectance_0_1":
+        cmd += ["-scale", "0", "1", "0", "10000"]
+        cmd += ["-a_nodata", str(int(nodata_uint16))]
+        cmd += ["-mo", "scale_factor=0.0001"]
+        cmd += ["-mo", "units=reflectance"]
+        cmd += ["-mo", f"uint16_nodata={int(nodata_uint16)}"]
+
     if assign_epsg:
         cmd += ["-a_srs", assign_epsg]
+
     cmd += [src_path, dst_tif]
     return run_cmd(cmd, check=True)
+
 
 
 
@@ -561,9 +585,11 @@ def nc_to_envi(
 
             # Save orthorectified GeoTIFF (this is your GLT-projected cube in Geographic Lat/Lon)
             if save_geotiffs:
-                info["commands"]["gdal_translate_data_ortho"] = _gdal_translate_to_tif(
-                    data_gcs, str(ortho_tif), assign_epsg="EPSG:4326"
-                )
+                info["commands"]["gdal_translate_data_ortho"] = export_uint16_deflate_geotiff(
+                data_gcs, str(ortho_tif),
+                assign_epsg="EPSG:4326",
+                scale_mode="emit_reflectance_0_1"
+)
                 info["outputs"]["data_ortho_tif"] = str(ortho_tif)
                 info["rasters"]["data_ortho_tif"] = raster_meta(str(ortho_tif))
 
@@ -576,9 +602,10 @@ def nc_to_envi(
             info["rasters"]["data_envi"] = raster_meta(str(data_utm))
 
             if save_geotiffs:
-                info["commands"]["gdal_translate_data_utm"] = _gdal_translate_to_tif(
-                    str(data_utm), str(utm_tif)
-                )
+                info["commands"]["gdal_translate_data_utm"] = export_uint16_deflate_geotiff(
+                str(data_utm), str(utm_tif),
+                scale_mode="emit_reflectance_0_1"
+)
                 info["outputs"]["data_utm_tif"] = str(utm_tif)
                 info["rasters"]["data_utm_tif"] = raster_meta(str(utm_tif))
 
@@ -661,7 +688,10 @@ def nc_to_envi(
 
             if save_geotiffs:
                 loc_tif = (out_dir_p / "geotiff" / f"{tag}_LOC_warp_utm.tif")
-                info["commands"]["gdal_translate_loc_utm"] = _gdal_translate_to_tif(str(loc_utm), str(loc_tif))
+                info["commands"]["gdal_translate_loc_utm"] = export_uint16_deflate_geotiff(
+                    str(loc_utm), str(loc_tif),
+                    scale_mode="emit_reflectance_0_1"
+                )
                 info["outputs"]["loc_utm_tif"] = str(loc_tif)
                 info["rasters"]["loc_utm_tif"] = raster_meta(str(loc_tif))
 
@@ -746,7 +776,10 @@ def nc_to_envi(
 
                 if save_geotiffs:
                     obs_tif = (out_dir_p / "geotiff" / f"{tag}_OBS_warp_utm.tif")
-                    info["commands"]["gdal_translate_obs_utm"] = _gdal_translate_to_tif(str(obs_utm), str(obs_tif))
+                    info["commands"]["gdal_translate_obs_utm"] = export_uint16_deflate_geotiff(
+                        str(obs_utm), str(obs_tif),
+                        scale_mode="emit_reflectance_0_1"
+                    )
                     info["outputs"]["obs_utm_tif"] = str(obs_tif)
                     info["rasters"]["obs_utm_tif"] = raster_meta(str(obs_tif))
 
