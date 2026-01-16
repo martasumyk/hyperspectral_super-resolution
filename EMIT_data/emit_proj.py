@@ -232,7 +232,7 @@ def open_any_nc(path):
 
 def run_cmd(cmd: list[str], check=True) -> dict:
     """Run a subprocess command and return a JSON-friendly record (with truncated stdout/stderr)."""
-    res = subprocess.run(cmd, text=True, capture_output=True)
+    res = subprocess.run(cmd, text=True,)
     rec = {
         "cmd": cmd,
         "cmd_str": shlex.join(cmd),
