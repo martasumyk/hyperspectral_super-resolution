@@ -525,11 +525,13 @@ def nc_to_envi(
             cmd = ["gdalwarp"]
             if overwrite:
                 cmd.append("-overwrite")
+            cmd += ["--config", "GDAL_CACHEMAX", "2048"]
 
             cmd += ["-t_srs", out_crs]
             cmd += ["-tr", str(xres), str(yres)]
             cmd += ["-te", str(left), str(aligned_bottom), str(aligned_right), str(top)]
             cmd += ["-srcnodata", str(NO_DATA_VALUE), "-dstnodata", str(NO_DATA_VALUE)]
+            cmd += ["-multi", "-wo", "NUM_THREADS=ALL_CPUS", "-wm", "2048"]
             cmd += ["-r", "cubic", "-of", "ENVI", src_path, dst_path]
 
             rec = run_cmd(cmd, check=True)
