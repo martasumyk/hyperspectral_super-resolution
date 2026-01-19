@@ -19,6 +19,12 @@ from s2_data.cloud_utils import (
 )
 
 
+from rasterio.windows import from_bounds
+from rasterio.windows import Window
+from rasterio.windows import transform as win_transform
+
+
+
 def find_best_s2_for_date(date_iso: str, lon: float, lat: float,
                           s2_collection, search_buffer, s2_api):
     """For the SAME date, search S2 in ROI; return least-cloudy item + cloud fraction using SCL."""
@@ -445,3 +451,47 @@ def download_s2_spectral_stack(item, s2_dir: Path) -> Path:
             dst.set_band_description(i, name)
 
     return out_stack
+
+
+def crop_s2_stack_to_te(s2_stack_path, out_path, left, bottom, right, top, overwrite=False):
+    s2_stack_path = Path(s2_stack_path)
+    out_path = Path(out_path)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+
+    if out_path.exists() and not overwrite:
+        print("Cropped S2 already exists.")
+        return out_path
+
+    with rasterio.open(s2_stack_path) as ds:
+        w = from_bounds(left, bottom, right, top, transform=ds.transform)
+
+        w_int = Window(
+            col_off=int(round(w.col_off)),
+            row_off=int(round(w.row_off)),
+            width=int(round(w.width)),
+            height=int(round(w.height)),
+        )
+
+        full = Window(0, 0, ds.width, ds.height)
+        w_int = w_int.intersection(full)
+
+        if w_int.width <= 0 or w_int.height <= 0:
+            raise ValueError("Overlap window is empty after clipping. Check -te / CRS inputs.")
+
+        profile = ds.profile.copy()
+        profile.update(
+            driver="GTiff",
+            width=int(w_int.width),
+            height=int(w_int.height),
+            transform=win_transform(w_int, ds.transform),
+            tiled=True,
+            compress="DEFLATE",
+            predictor=2,
+            zlevel=1,
+        )
+
+        with rasterio.open(out_path, "w", **profile) as out:
+            out.write(ds.read(window=w_int))
+
+    print("Wrote:", out_path)
+    return out_path

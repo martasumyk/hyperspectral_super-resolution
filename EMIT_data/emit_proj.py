@@ -561,11 +561,10 @@ def nc_to_envi(
         }
 
 
-        def _run_gdalwarp(src_path: str, dst_path: str) -> dict:
+        def _run_gdalwarp(src_path: str, dst_path: str, xres = 60.0, yres = 60.0) -> dict:
             if s2_bounds is None:
                 raise ValueError("s2_bounds is None. Need s2_tif_path to align output grid.")
 
-            xres, yres = 60.0, 60.0
 
             left, bottom, right, top = _compute_te(src_path, s2_bounds, out_crs, xres=xres, yres=yres)
 
