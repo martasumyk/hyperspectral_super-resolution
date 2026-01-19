@@ -20,7 +20,8 @@ from pathlib import Path
 import rasterio
 from rasterio.warp import transform_bounds
 
-import subprocess
+
+from pyproj import Transformer
 
 
 NO_DATA_VALUE = -9999.0
@@ -305,6 +306,63 @@ def raster_meta(path: str) -> dict:
         return out
 
 
+def _bounds_to_out_crs(src_path: str, out_crs: str):
+    with rasterio.open(src_path) as ds:
+        b = ds.bounds
+        src_crs = ds.crs
+    if src_crs is None:
+        raise ValueError(f"Source CRS is None for {src_path}")
+
+    tf = Transformer.from_crs(src_crs, out_crs, always_xy=True)
+
+    # transform all 4 corners (safe for rotation-ish cases)
+    xs = [b.left, b.left, b.right, b.right]
+    ys = [b.bottom, b.top, b.bottom, b.top]
+    X, Y = tf.transform(xs, ys)
+
+    return (min(X), min(Y), max(X), max(Y))  # left, bottom, right, top
+
+def _intersect(a, b):
+    # a,b: (l,b,r,t)
+    l = max(a[0], b[0]); bb = max(a[1], b[1])
+    r = min(a[2], b[2]); t = min(a[3], b[3])
+    if (r <= l) or (t <= bb):
+        return None
+    return (l, bb, r, t)
+
+def _snap_te_to_s2_grid(te, s2_bounds, xres=60.0, yres=60.0):
+    # snap to a grid anchored at s2_left/top
+    s2_left = float(s2_bounds.left)
+    s2_top  = float(s2_bounds.top)
+
+    l, b, r, t = te
+
+    # snap left/right to columns
+    col0 = math.floor((l - s2_left) / xres)
+    col1 = math.ceil((r - s2_left) / xres)
+    l2 = s2_left + col0 * xres
+    r2 = s2_left + col1 * xres
+
+    # snap top/bottom to rows (note y axis downward in row indexing)
+    row0 = math.floor((s2_top - t) / yres)
+    row1 = math.ceil((s2_top - b) / yres)
+    t2 = s2_top - row0 * yres
+    b2 = s2_top - row1 * yres
+
+    return (l2, b2, r2, t2)
+
+def _compute_te(src_path, s2_bounds, out_crs, xres=60.0, yres=60.0):
+    src_te = _bounds_to_out_crs(src_path, out_crs)
+    s2_te  = (float(s2_bounds.left), float(s2_bounds.bottom),
+              float(s2_bounds.right), float(s2_bounds.top))
+
+    inter = _intersect(src_te, s2_te)
+    if inter is None:
+        raise ValueError("No overlap between EMIT source bounds and S2 bounds in out_crs.")
+
+    inter_snapped = _snap_te_to_s2_grid(inter, s2_bounds, xres=xres, yres=yres)
+    return inter_snapped
+
 
 
 def nc_to_envi(
@@ -509,12 +567,8 @@ def nc_to_envi(
 
             xres, yres = 60.0, 60.0
 
-            left, bottom, right, top = (
-                float(s2_bounds.left),
-                float(s2_bounds.bottom),
-                float(s2_bounds.right),
-                float(s2_bounds.top),
-            )
+            left, bottom, right, top = _compute_te(src_path, s2_bounds, out_crs, xres=xres, yres=yres)
+
 
             cols = math.ceil((right - left) / xres)
             rows = math.ceil((top - bottom) / yres)
