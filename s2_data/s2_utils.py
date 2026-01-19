@@ -452,19 +452,22 @@ def download_s2_spectral_stack(item, s2_dir: Path) -> Path:
 
     return out_stack
 
-
-def crop_s2_stack_to_te(s2_stack_path, out_path, left, bottom, right, top, overwrite=False):
+def crop_s2_stack_to_te(
+    s2_stack_path,
+    out_path,
+    left, bottom, right, top,
+    overwrite=False,
+):
     s2_stack_path = Path(s2_stack_path)
     out_path = Path(out_path)
     out_path.parent.mkdir(parents=True, exist_ok=True)
 
     if out_path.exists() and not overwrite:
-        print("Cropped S2 already exists.")
+        print("Cropped output already exists")
         return out_path
 
-    with rasterio.open(s2_stack_path) as ds:
-        w = from_bounds(left, bottom, right, top, transform=ds.transform)
-
+    with rasterio.open(s2_stack_path) as src:
+        w = from_bounds(left, bottom, right, top, transform=src.transform)
         w_int = Window(
             col_off=int(round(w.col_off)),
             row_off=int(round(w.row_off)),
@@ -472,26 +475,59 @@ def crop_s2_stack_to_te(s2_stack_path, out_path, left, bottom, right, top, overw
             height=int(round(w.height)),
         )
 
-        full = Window(0, 0, ds.width, ds.height)
+        full = Window(0, 0, src.width, src.height)
         w_int = w_int.intersection(full)
 
         if w_int.width <= 0 or w_int.height <= 0:
             raise ValueError("Overlap window is empty after clipping. Check -te / CRS inputs.")
 
-        profile = ds.profile.copy()
+        out_transform = win_transform(w_int, src.transform)
+
+        profile = src.profile.copy()
         profile.update(
             driver="GTiff",
             width=int(w_int.width),
             height=int(w_int.height),
-            transform=win_transform(w_int, ds.transform),
+            transform=out_transform,
             tiled=True,
             compress="DEFLATE",
             predictor=2,
             zlevel=1,
         )
 
-        with rasterio.open(out_path, "w", **profile) as out:
-            out.write(ds.read(window=w_int))
+        # reasonable internal tiling
+        bx = min(512, profile["width"])
+        by = min(512, profile["height"])
+        profile.update(blockxsize=bx, blockysize=by)
+
+        # capture metadata we want to preserve
+        src_desc = list(src.descriptions) 
+        src_tags = src.tags()
+        src_band_tags = [src.tags(i) for i in range(1, src.count + 1)]
+
+        data = src.read(window=w_int)
+
+        with rasterio.open(out_path, "w", **profile) as dst:
+            dst.write(data)
+
+            # copy dataset tags
+            if src_tags:
+                dst.update_tags(**src_tags)
+
+            # copy per-band tags + descriptions
+            for i in range(1, src.count + 1):
+                bt = src_band_tags[i - 1]
+                if bt:
+                    dst.update_tags(i, **bt)
+
+                d = src_desc[i - 1] if i - 1 < len(src_desc) else None
+                if d:  # only set if non-empty
+                    dst.set_band_description(i, d)
 
     print("Wrote:", out_path)
+
+    # # quick check
+    # with rasterio.open(out_path) as chk:
+    #     print("Band descriptions:", chk.descriptions)
+
     return out_path
