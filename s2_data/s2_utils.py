@@ -457,6 +457,7 @@ def crop_s2_stack_to_te(
     out_path,
     left, bottom, right, top,
     overwrite=False,
+    return_info=False,   # NEW
 ):
     s2_stack_path = Path(s2_stack_path)
     out_path = Path(out_path)
@@ -464,6 +465,8 @@ def crop_s2_stack_to_te(
 
     if out_path.exists() and not overwrite:
         print("Cropped output already exists")
+        if return_info:
+            return out_path, {"note": "already existed", "out_path": str(out_path)}
         return out_path
 
     with rasterio.open(s2_stack_path) as src:
@@ -495,13 +498,11 @@ def crop_s2_stack_to_te(
             zlevel=1,
         )
 
-        # reasonable internal tiling
         bx = min(512, profile["width"])
         by = min(512, profile["height"])
         profile.update(blockxsize=bx, blockysize=by)
 
-        # capture metadata we want to preserve
-        src_desc = list(src.descriptions) 
+        src_desc = list(src.descriptions)
         src_tags = src.tags()
         src_band_tags = [src.tags(i) for i in range(1, src.count + 1)]
 
@@ -510,25 +511,42 @@ def crop_s2_stack_to_te(
         with rasterio.open(out_path, "w", **profile) as dst:
             dst.write(data)
 
-            # copy dataset tags
             if src_tags:
                 dst.update_tags(**src_tags)
 
-            # copy per-band tags + descriptions
             for i in range(1, src.count + 1):
                 bt = src_band_tags[i - 1]
                 if bt:
                     dst.update_tags(i, **bt)
 
                 d = src_desc[i - 1] if i - 1 < len(src_desc) else None
-                if d:  # only set if non-empty
+                if d:
                     dst.set_band_description(i, d)
 
     print("Wrote:", out_path)
 
-    # quick check
-    with rasterio.open(out_path) as chk:
-        print("Band descriptions:", chk.descriptions)
+    # Build small provenance dict (NEW)
+    crop_info = {
+        "src_path": str(s2_stack_path),
+        "out_path": str(out_path),
+        "te": {"left": float(left), "bottom": float(bottom), "right": float(right), "top": float(top)},
+        "window": {"col_off": int(w_int.col_off), "row_off": int(w_int.row_off), "width": int(w_int.width), "height": int(w_int.height)},
+        "profile": {
+            "crs": str(profile.get("crs")),
+            "dtype": str(profile.get("dtype")),
+            "count": int(profile.get("count")),
+            "width": int(profile.get("width")),
+            "height": int(profile.get("height")),
+            "compress": profile.get("compress"),
+            "tiled": bool(profile.get("tiled", False)),
+            "blockxsize": int(profile.get("blockxsize", 0)),
+            "blockysize": int(profile.get("blockysize", 0)),
+        },
+        "band_descriptions": list(src_desc),
+    }
 
+    if return_info:
+        return out_path, crop_info
     return out_path
+
 

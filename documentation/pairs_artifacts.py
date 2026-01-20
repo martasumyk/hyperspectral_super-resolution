@@ -148,14 +148,14 @@ class RunPaths:
             drive_manifest_csv=drive_root / "manifest.csv",
         )
 
-    @classmethod
-    def from_emit_nc(
-        cls,
-        emit_nc: str | Path,
-        local_root: str | Path,
-        drive_root_base: str | Path | None = None,
-    ) -> "RunPaths":
-        return cls.build(emit_nc=emit_nc, local_root=local_root, drive_base=drive_root_base)
+    # @classmethod
+    # def from_emit_nc(
+    #     cls,
+    #     emit_nc: str | Path,
+    #     local_root: str | Path,
+    #     drive_root_base: str | Path | None = None,
+    # ) -> "RunPaths":
+    #     return cls.build(emit_nc=emit_nc, local_root=local_root, drive_base=drive_root_base)
 
 
 class ReportWriter:
