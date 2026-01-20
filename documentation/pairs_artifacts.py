@@ -1,13 +1,13 @@
 from __future__ import annotations
 
-from dataclasses import dataclass, asdict
+from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Optional, Iterable
+from typing import Any, Iterable, Optional
+
 import json
-import os
 import shutil
 import subprocess
-from datetime import datetime, timezone
 
 import rasterio
 from rasterio.warp import transform_bounds
@@ -15,36 +15,53 @@ from rasterio.warp import transform_bounds
 import pandas as pd
 
 
+# -----------------------------------------------------------------------------
+# Small utils
+# -----------------------------------------------------------------------------
+
 def utc_now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
-def ensure_dir(p: Path) -> Path:
+def ensure_dir(p: str | Path) -> Path:
+    p = Path(p)
     p.mkdir(parents=True, exist_ok=True)
     return p
 
 
-def write_json(path: Path, obj: Any, *, indent: int = 2) -> Path:
+def write_json(path: str | Path, obj: Any, *, indent: int = 2) -> Path:
     path = Path(path)
     ensure_dir(path.parent)
     path.write_text(json.dumps(obj, indent=indent, default=str))
     return path
 
 
+# -----------------------------------------------------------------------------
+# Paths
+# -----------------------------------------------------------------------------
+
 
 @dataclass(frozen=True)
 class RunPaths:
-    """Filesystem layout for a single EMIT and S-2 pair"""
+    """
+    Folder layout for one pair.
+    """
 
-    # local outputs
+    run_id: str
+
+    # local
     local_root: Path
     local_emit: Path
     local_s2: Path
     local_emit_utm: Path
     local_plots: Path
     local_tiles: Path
+    local_meta: Path
+    local_tile_meta: Path
+    local_report_md: Path
+    local_manifest_csv: Path
 
-    # drive outputs
+    # drive
     drive_root: Optional[Path] = None
     drive_emit: Optional[Path] = None
     drive_s2: Optional[Path] = None
@@ -52,15 +69,13 @@ class RunPaths:
     drive_plots: Optional[Path] = None
     drive_tiles: Optional[Path] = None
     drive_meta: Optional[Path] = None
-
+    drive_tile_meta: Optional[Path] = None
     drive_report_md: Optional[Path] = None
     drive_manifest_csv: Optional[Path] = None
 
     @staticmethod
-    def _emit_id_from_nc(emit_nc: str | Path) -> str:
-        p = Path(emit_nc)
-        stem = p.stem
-        # notebook convention: EMIT_L2A_RFL_<id>
+    def emit_id_from_nc(emit_nc: str | Path) -> str:
+        stem = Path(emit_nc).stem
         return stem.replace("EMIT_L2A_RFL_", "", 1)
 
     @classmethod
@@ -71,43 +86,56 @@ class RunPaths:
         local_root: str | Path,
         drive_base: str | Path | None = None,
     ) -> "RunPaths":
-        """Create output folders. If drive_base is provided, it will create a subfolder per granule id."""
-        local_root = Path(local_root)
-        ensure_dir(local_root)
+        run_id = cls.emit_id_from_nc(emit_nc)
 
+        # local
+        local_root = ensure_dir(local_root)
         local_emit = ensure_dir(local_root / "emit")
         local_s2 = ensure_dir(local_root / "s2")
         local_emit_utm = ensure_dir(local_root / "emit_utm")
         local_plots = ensure_dir(local_root / "plots")
         local_tiles = ensure_dir(local_root / "tiles")
+        local_meta = ensure_dir(local_root / "metadata")
+        local_tile_meta = ensure_dir(local_meta / "tiles")
+        local_report_md = local_root / "report.md"
+        local_manifest_csv = local_root / "manifest.csv"
 
         if drive_base is None:
             return cls(
+                run_id=run_id,
                 local_root=local_root,
                 local_emit=local_emit,
                 local_s2=local_s2,
                 local_emit_utm=local_emit_utm,
                 local_plots=local_plots,
                 local_tiles=local_tiles,
+                local_meta=local_meta,
+                local_tile_meta=local_tile_meta,
+                local_report_md=local_report_md,
+                local_manifest_csv=local_manifest_csv,
             )
 
-        emit_id = cls._emit_id_from_nc(emit_nc)
-        drive_root = ensure_dir(Path(drive_base) / emit_id)
-
+        drive_root = ensure_dir(Path(drive_base) / run_id)
         drive_emit = ensure_dir(drive_root / "emit")
         drive_s2 = ensure_dir(drive_root / "s2")
         drive_emit_utm = ensure_dir(drive_root / "emit_utm")
         drive_plots = ensure_dir(drive_root / "plots")
         drive_tiles = ensure_dir(drive_root / "tiles")
         drive_meta = ensure_dir(drive_root / "metadata")
+        drive_tile_meta = ensure_dir(drive_meta / "tiles")
 
         return cls(
+            run_id=run_id,
             local_root=local_root,
             local_emit=local_emit,
             local_s2=local_s2,
             local_emit_utm=local_emit_utm,
             local_plots=local_plots,
             local_tiles=local_tiles,
+            local_meta=local_meta,
+            local_tile_meta=local_tile_meta,
+            local_report_md=local_report_md,
+            local_manifest_csv=local_manifest_csv,
             drive_root=drive_root,
             drive_emit=drive_emit,
             drive_s2=drive_s2,
@@ -115,34 +143,48 @@ class RunPaths:
             drive_plots=drive_plots,
             drive_tiles=drive_tiles,
             drive_meta=drive_meta,
+            drive_tile_meta=drive_tile_meta,
             drive_report_md=drive_root / "report.md",
             drive_manifest_csv=drive_root / "manifest.csv",
         )
 
+    @classmethod
+    def from_emit_nc(
+        cls,
+        emit_nc: str | Path,
+        local_root: str | Path,
+        drive_root_base: str | Path | None = None,
+    ) -> "RunPaths":
+        return cls.build(emit_nc=emit_nc, local_root=local_root, drive_base=drive_root_base)
 
-class RunReport:
+
+class ReportWriter:
     """
-    Create markdown report for tiling process.
+    Report
     """
 
-    def __init__(self, path: str | Path):
+    def __init__(self, path: str | Path, *, mode: str = "overwrite"):
         self.path = Path(path)
         ensure_dir(self.path.parent)
+        self.mode = mode
+        self._started = False
 
-    def start(self, *, overwrite: bool = True, 
-              title: str = "EMIT and Sentinel-2 pairing report", 
-              extra_header_lines: Iterable[str] | None = None) -> None:
-        mode = "w" if overwrite else "a"
-        with self.path.open(mode, encoding="utf-8") as f:
-            if overwrite:
-                f.write(f"# {title}\n")
-                f.write(f"\n- Generated: {utc_now_iso()}\n")
-                if extra_header_lines:
-                    for ln in extra_header_lines:
-                        f.write(f"- {ln}\n")
-                f.write("\n")
+    def start(self, *, title: str = "EMIT and Sentinel-2 pairs report") -> "ReportWriter":
+        if self._started:
+            return self
+
+        overwrite = self.mode.lower() in {"overwrite", "w", "write"}
+        if overwrite:
+            self.path.write_text(f"# {title}\n\n- Generated: {utc_now_iso()}\n")
+        else:
+            if not self.path.exists():
+                self.path.write_text(f"# {title}\n\n- Generated: {utc_now_iso()}\n")
+        self._started = True
+        return self
 
     def section(self, heading: str, lines: Iterable[str]) -> None:
+        if not self._started:
+            self.start()
         with self.path.open("a", encoding="utf-8") as f:
             f.write(f"\n## {heading}\n")
             for ln in lines:
@@ -151,73 +193,139 @@ class RunReport:
                 f.write(f"- {ln}\n")
 
     def raw(self, text: str) -> None:
+        if not self._started:
+            self.start()
         with self.path.open("a", encoding="utf-8") as f:
             f.write(text)
 
 
-def bounds_from_bbox(bbox: Any) -> Optional[list[float]]:
-    """
-    Calculate Sentinel-2 bounds from its bbox.
-    """
-    if not bbox or len(bbox) != 4:
-        return None
-    xmin, ymin, xmax, ymax = map(float, bbox)
-    return [xmin, ymin, xmax, ymax]
+# -----------------------------------------------------------------------------
+# EMIT helpers
+# -----------------------------------------------------------------------------
 
 
-def centroid_from_bounds(bounds: Optional[list[float]]) -> Optional[dict[str, float]]:
+def emit_polygon_bounds_wgs84(umm: dict):
     """
-    Calculate centroid from bounds.
+    Return bounds from first UMM Polygon
     """
-    if not bounds:
-        return None
-    xmin, ymin, xmax, ymax = bounds
-    return {"lon": (xmin + xmax) / 2.0, "lat": (ymin + ymax) / 2.0}
+    polys = (
+        umm.get("SpatialExtent", {})
+        .get("HorizontalSpatialDomain", {})
+        .get("Geometry", {})
+        .get("GPolygons", [])
+    )
+    if not polys:
+        return None, None
+
+    pts = polys[0].get("Boundary", {}).get("Points", [])
+    if not pts:
+        return None, None
+
+    lons = [p["Longitude"] for p in pts if "Longitude" in p]
+    lats = [p["Latitude"] for p in pts if "Latitude" in p]
+    if not lons or not lats:
+        return None, None
+
+    bounds = [float(min(lons)), float(min(lats)), float(max(lons)), float(max(lats))]
+    centroid = {"lon": (bounds[0] + bounds[2]) / 2.0, "lat": (bounds[1] + bounds[3]) / 2.0}
+    return bounds, centroid
+
+
+def emit_file_records(umm: dict):
+    """
+    EMIT UMM sizes and stuff
+    """
+    recs = umm.get("DataGranule", {}).get("ArchiveAndDistributionInformation", [])
+    out = []
+    for r in recs:
+        out.append(
+            {
+                "name": r.get("Name"),
+                "size_bytes": r.get("SizeInBytes"),
+                "format": r.get("Format"),
+                "checksum": r.get("Checksum", {}),
+            }
+        )
+    return out
+
+
+def emit_related_urls(umm: dict):
+    """
+    URLs for report
+    """
+    urls = umm.get("RelatedUrls", []) or []
+    keep = []
+    for u in urls:
+        url = u.get("URL", "")
+        typ = u.get("Type")
+        desc = u.get("Description")
+        sub = u.get("Subtype")
+        if typ in (
+            "GET DATA",
+            "GET DATA VIA DIRECT ACCESS",
+            "EXTENDED METADATA",
+            "USE SERVICE API",
+        ):
+            keep.append({"url": url, "type": typ, "subtype": sub, "description": desc})
+    return keep
 
 
 def write_emit_metadata(
     emit_item: dict,
     out_dir: str | Path,
     *,
-    report: RunReport | None = None,
+    report: ReportWriter | None = None,
 ) -> dict:
     """
-    Write raw and summarized EMIT metadata
-
+    Metadata and summary for EMIT
     """
-    out_dir = ensure_dir(Path(out_dir))
+    out_dir = ensure_dir(out_dir)
 
     meta_raw_path = out_dir / "emit_meta_raw.json"
     umm_raw_path = out_dir / "emit_umm_raw.json"
+    summary_path = out_dir / "emit_summary.json"
 
     write_json(meta_raw_path, emit_item.get("meta", {}) or {})
     write_json(umm_raw_path, emit_item.get("umm", {}) or {})
 
     umm = emit_item.get("umm", {}) or {}
-    begin = (((umm.get("TemporalExtent") or {}).get("RangeDateTime") or {}).get("BeginningDateTime"))
-    end = (((umm.get("TemporalExtent") or {}).get("RangeDateTime") or {}).get("EndingDateTime"))
+    begin = (umm.get("TemporalExtent") or {}).get("RangeDateTime", {}).get("BeginningDateTime")
+    end = (umm.get("TemporalExtent") or {}).get("RangeDateTime", {}).get("EndingDateTime")
 
-    add_attrs = {a.get("Name"): a.get("Values") for a in (umm.get("AdditionalAttributes") or []) if isinstance(a, dict)}
+    bounds_wgs84, centroid_wgs84 = emit_polygon_bounds_wgs84(umm)
+
+    add_attrs = {
+        a["Name"]: a.get("Values")
+        for a in (umm.get("AdditionalAttributes") or [])
+        if isinstance(a, dict) and "Name" in a
+    }
 
     summary = {
         "granule_ur": umm.get("GranuleUR"),
         "native_id": (emit_item.get("meta", {}) or {}).get("native-id"),
         "concept_id": (emit_item.get("meta", {}) or {}).get("concept-id"),
+        "collection": umm.get("CollectionReference"),
         "time": {"begin": begin, "end": end},
         "cloud_cover_umm": umm.get("CloudCover"),
+        "spatial": {
+            "bounds_wgs84": bounds_wgs84,
+            "centroid_wgs84": centroid_wgs84,
+        },
         "orbit_scene": {
             "ORBIT": add_attrs.get("ORBIT"),
             "ORBIT_SEGMENT": add_attrs.get("ORBIT_SEGMENT"),
             "SCENE": add_attrs.get("SCENE"),
         },
+        "pge": umm.get("PGEVersionClass"),
         "software": {
             "SOFTWARE_BUILD_VERSION": add_attrs.get("SOFTWARE_BUILD_VERSION"),
             "SOFTWARE_DELIVERY_VERSION": add_attrs.get("SOFTWARE_DELIVERY_VERSION"),
         },
+        "files": emit_file_records(umm),
+        "related_urls": emit_related_urls(umm),
         "size_mb_from_item": emit_item.get("size"),
     }
 
-    summary_path = out_dir / "emit_summary.json"
     write_json(summary_path, summary)
 
     if report is not None:
@@ -228,29 +336,38 @@ def write_emit_metadata(
                 f"Native ID: {summary['native_id']}",
                 f"Time begin/end: {begin} → {end}",
                 f"CloudCover (UMM): {summary['cloud_cover_umm']}",
+                f"Bounds WGS84 (UMM polygon): {bounds_wgs84}",
+                f"Centroid WGS84: {centroid_wgs84}",
                 f"Orbit/Scene: ORBIT={summary['orbit_scene']['ORBIT']} SCENE={summary['orbit_scene']['SCENE']}",
-                f"Raw metadata saved: {meta_raw_path.name}, {umm_raw_path.name}",
+                f"Raw metadata: {umm_raw_path.name}, {meta_raw_path.name}",
             ],
         )
 
     return summary
 
 
+# -----------------------------------------------------------------------------
+# S2 helpers
+# -----------------------------------------------------------------------------
+
+
+def bounds_from_bbox(bbox: Any) -> Optional[list[float]]:
+    if not bbox or len(bbox) != 4:
+        return None
+    xmin, ymin, xmax, ymax = map(float, bbox)
+    return [xmin, ymin, xmax, ymax]
+
+
+def centroid_from_bounds(bounds: Optional[list[float]]) -> Optional[dict[str, float]]:
+    if not bounds:
+        return None
+    xmin, ymin, xmax, ymax = bounds
+    return {"lon": (xmin + xmax) / 2.0, "lat": (ymin + ymax) / 2.0}
+
+
 def pick_s2_assets_minimal(s2_dict: dict) -> dict:
-    """
-    Pick a subset of S-2's assets for documentation.
-    """
     assets = s2_dict.get("assets", {}) or {}
-    keep_keys = [
-        "visual",
-        "B02",
-        "B03",
-        "B04",
-        "B08",
-        "B11",
-        "B12",
-        "SCL",
-    ]
+    keep_keys = ["visual", "B02", "B03", "B04", "B08", "B11", "B12", "SCL"]
     out = {}
     for k in keep_keys:
         a = assets.get(k)
@@ -263,16 +380,18 @@ def write_s2_metadata(
     s2_item: Any,
     out_dir: str | Path,
     *,
-    report: RunReport | None = None,
+    report: ReportWriter | None = None,
 ) -> dict:
     """
-    Write raw and summarized Sentinel-2 metadata.
+    Metadata and summary
     """
-    out_dir = ensure_dir(Path(out_dir))
+    out_dir = ensure_dir(out_dir)
 
     s2_dict = s2_item if isinstance(s2_item, dict) else (s2_item.to_dict() if hasattr(s2_item, "to_dict") else {})
 
     raw_path = out_dir / "s2_item_raw.json"
+    summary_path = out_dir / "s2_summary.json"
+
     write_json(raw_path, s2_dict)
 
     props = s2_dict.get("properties", {}) or {}
@@ -325,7 +444,6 @@ def write_s2_metadata(
         "assets_minimal": pick_s2_assets_minimal(s2_dict),
     }
 
-    summary_path = out_dir / "s2_summary.json"
     write_json(summary_path, summary)
 
     if report is not None:
@@ -341,21 +459,21 @@ def write_s2_metadata(
                 f"BBox WGS84: {summary['spatial']['bbox_wgs84']}",
                 f"Centroid WGS84: {summary['spatial']['centroid_wgs84']}",
                 f"eo:cloud_cover (%): {summary['clouds']['eo:cloud_cover']}",
-                f"Raw metadata saved: {raw_path.name}",
+                f"Raw metadata: {raw_path.name}",
             ],
         )
 
     return summary
 
 
-# --------------------------------------------------------------------------------------
-# GeoTIFF summary (for tiles)
-# --------------------------------------------------------------------------------------
+# -----------------------------------------------------------------------------
+# this one is for tiles
+# -----------------------------------------------------------------------------
 
 
 def tif_geo_summary(path: str | Path) -> dict:
     """
-    Return basic geospatial metadata for a GeoTIFF.
+    get geoTIFF spatial summary
     """
 
     p = Path(path)
@@ -365,48 +483,39 @@ def tif_geo_summary(path: str | Path) -> dict:
     with rasterio.open(p) as ds:
         b = ds.bounds
         crs = ds.crs
-        bounds_crs = [float(b.left), float(b.bottom), float(b.right), float(b.top)]
-
-        bounds_wgs84 = None
-        centroid_wgs84 = None
-        try:
-            if crs is not None:
-                wb = transform_bounds(crs, "EPSG:4326", b.left, b.bottom, b.right, b.top, densify_pts=21)
-                bounds_wgs84 = [float(wb[0]), float(wb[1]), float(wb[2]), float(wb[3])]
-                centroid_wgs84 = centroid_from_bounds(bounds_wgs84)
-        except Exception as e:
-            bounds_wgs84 = None
-
-        return {
+        out = {
             "path": str(p),
-            "crs": str(crs) if crs is not None else None,
-            "size": {"width": int(ds.width), "height": int(ds.height), "count": int(ds.count)},
-            "bounds_crs": bounds_crs,
-            "bounds_wgs84": bounds_wgs84,
-            "centroid_wgs84": centroid_wgs84,
-            "transform": tuple(ds.transform) if ds.transform is not None else None,
+            "crs": crs.to_string() if crs else None,
+            "bounds_crs": [float(b.left), float(b.bottom), float(b.right), float(b.top)],
+            "shape": [int(ds.height), int(ds.width)],
+            "res": [float(ds.res[0]), float(ds.res[1])] if ds.res else None,
+            "nodata": ds.nodata,
         }
 
+        if crs:
+            wb = transform_bounds(crs, "EPSG:4326", b.left, b.bottom, b.right, b.top, densify_pts=21)
+            out["bounds_wgs84"] = [float(wb[0]), float(wb[1]), float(wb[2]), float(wb[3])]
+            xmin, ymin, xmax, ymax = out["bounds_wgs84"]
+            out["centroid_wgs84"] = {"lon": (xmin + xmax) / 2.0, "lat": (ymin + ymax) / 2.0}
 
-# --------------------------------------------------------------------------------------
-# Tile metadata + manifest
-# --------------------------------------------------------------------------------------
+        return out
+
 
 @dataclass
 class TileRecord:
     idx: int
     emit_tif: str
     s2_tif: str
-    plot_png: str | None = None
+    plot_png: Optional[str] = None
 
-    emit_geo: dict | None = None
-    s2_geo: dict | None = None
+    emit_black_frac: Optional[float] = None
+    s2_black_frac: Optional[float] = None
 
-    emit_black_frac: float | None = None
-    s2_black_frac: float | None = None
+    emit_geo: Optional[dict] = None
+    s2_geo: Optional[dict] = None
 
-    emit_window: dict | None = None
-    s2_window: dict | None = None
+    emit_window: Optional[dict] = None
+    s2_window: Optional[dict] = None
 
     def to_manifest_row(self) -> dict:
         row = {
@@ -418,7 +527,7 @@ class TileRecord:
             "s2_black_frac": self.s2_black_frac,
         }
 
-        def _pull(prefix: str, g: dict | None):
+        def _pull(prefix: str, g: Optional[dict]):
             if not isinstance(g, dict):
                 return
             row[f"{prefix}_crs"] = g.get("crs")
@@ -431,24 +540,28 @@ class TileRecord:
         return row
 
 
-def write_tile_doc(
-    *,
-    out_dir: str | Path,
+def write_tile_metadata(
     record: TileRecord,
+    tile_info: dict,
+    out_dir: str | Path,
+    *,
     emit_granule: str | None = None,
-    emit_datetime: Any = None,
+    emit_time: Any = None,
     s2_id: str | None = None,
     s2_datetime: str | None = None,
     params: dict | None = None,
-) -> Path:
-    out_dir = ensure_dir(Path(out_dir))
+) -> tuple[Path, dict]:
+    """
+    write summary for tiles 
+    """
+    out_dir = ensure_dir(out_dir)
 
     doc = {
         "tile_id": int(record.idx),
         "created_utc": utc_now_iso(),
         "pair": {
             "emit_granule": emit_granule,
-            "emit_time": emit_datetime,
+            "emit_time": emit_time,
             "s2_id": s2_id,
             "s2_datetime": s2_datetime,
         },
@@ -470,46 +583,50 @@ def write_tile_doc(
             "s2_tif": record.s2_tif,
             "plot_png": record.plot_png,
         },
+        "tile_info": tile_info or {},
     }
 
     path = out_dir / f"tile_{record.idx:03d}.json"
     write_json(path, doc)
-    return path
+    return path, record.to_manifest_row()
 
 
-def write_manifest_csv(path: str | Path, records: list[TileRecord] | list[dict]) -> Path:
-    """Write a manifest.csv.
-
-    Accepts either:
-      - list[TileRecord]
-      - list[dict] rows
+def write_manifest_csv(path: str | Path, rows: list[dict] | list[TileRecord]) -> Path:
+    """
+    Write manifest.csv
     """
 
     path = Path(path)
     ensure_dir(path.parent)
 
-    if len(records) == 0:
-        df = pd.DataFrame([])
-    else:
-        first = records[0]
-        if isinstance(first, TileRecord):
-            rows = [r.to_manifest_row() for r in records]  # type: ignore
-        else:
-            rows = records  # type: ignore
-        df = pd.DataFrame(rows)
+    if not rows:
+        pd.DataFrame([]).to_csv(path, index=False)
+        return path
 
-    df.to_csv(path, index=False)
+    if isinstance(rows[0], TileRecord):
+        data = [r.to_manifest_row() for r in rows] 
+    else:
+        data = rows
+
+    pd.DataFrame(data).to_csv(path, index=False)
     return path
 
 
-# --------------------------------------------------------------------------------------
-# Drive copy
-# --------------------------------------------------------------------------------------
+# -----------------------------------------------------------------------------
+# Drive stuff
+# -----------------------------------------------------------------------------
 
 
-def copy_any(src: str | Path, dst: str | Path, *, overwrite: bool = False, use_rsync: bool = True, exclude: list[str] | None = None) -> None:
+def copy_any(
+    src: str | Path,
+    dst: str | Path,
+    *,
+    overwrite: bool = False,
+    use_rsync: bool = True,
+    exclude: list[str] | None = None,
+) -> None:
     """
-    Copy file or directory src -> dst
+    copy file/dir
     """
     src = Path(src)
     dst = Path(dst)
@@ -525,22 +642,19 @@ def copy_any(src: str | Path, dst: str | Path, *, overwrite: bool = False, use_r
 
     if use_rsync:
         try:
+            cmd = ["rsync", "-a"]
+            if not overwrite:
+                cmd += ["--ignore-existing"]
+            for pat in exclude:
+                cmd += ["--exclude", pat]
             if src.is_dir():
-                cmd = ["rsync", "-a"]
-                if not overwrite:
-                    cmd += ["--ignore-existing"]
-                for pat in exclude:
-                    cmd += ["--exclude", pat]
                 cmd += [str(src) + "/", str(dst) + "/"]
             else:
-                cmd = ["rsync", "-a"]
-                if not overwrite:
-                    cmd += ["--ignore-existing"]
                 cmd += [str(src), str(dst)]
             subprocess.run(cmd, check=True)
             return
-        except Exception as e:
-            print("[WARN] rsync failed, falling back to shutil:", e)
+        except Exception:
+            pass
 
     if src.is_dir():
         for item in src.iterdir():
@@ -551,21 +665,18 @@ def copy_any(src: str | Path, dst: str | Path, *, overwrite: bool = False, use_r
                 if not target.exists():
                     shutil.copytree(item, target)
             else:
-                if target.exists() and (not overwrite):
+                if target.exists() and not overwrite:
                     continue
                 shutil.copy2(item, target)
     else:
-        if dst.is_dir():
-            target = dst / src.name
-        else:
-            target = dst
-        if target.exists() and (not overwrite):
+        target = (dst / src.name) if dst.is_dir() else dst
+        if target.exists() and not overwrite:
             return
         ensure_dir(target.parent)
         shutil.copy2(src, target)
 
 
-def write_archive_map(path: str | Path, mapping: dict[str, Any], *, report: RunReport | None = None) -> Path:
+def write_archive_map(path: str | Path, mapping: dict[str, Any], *, report: ReportWriter | None = None) -> Path:
     path = Path(path)
     write_json(path, mapping)
 
