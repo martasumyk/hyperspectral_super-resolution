@@ -163,17 +163,6 @@ def find_valid_paired_tiles(
         return tiles
 
 
-from pathlib import Path
-import numpy as np
-import rasterio
-from rasterio.windows import transform as window_transform
-
-
-from pathlib import Path
-import numpy as np
-import rasterio
-from rasterio.windows import transform as window_transform
-
 def save_tile_pair(
     emit_path,
     s2_path,
@@ -182,21 +171,23 @@ def save_tile_pair(
     *,
     tiled=True,
     overwrite=True,
-    emit_scale=10000.0,      
+    # EMIT uint16 scaling
+    emit_scale=10000.0,          
     emit_nodata_u16=65535,
+    # compression
     compress="DEFLATE",
     zlevel=1,
     num_threads="ALL_CPUS",
 ):
 
     def _auto_block_size(width: int, height: int) -> int:
-        #smaller tiles -> 64, larger -> 256.
+        # Simple rule: smaller tiles -> 64; medium/large -> 256.
         m = min(width, height)
         if m >= 256:
             return 256
         if m >= 64:
             return 64
-        return 16  
+        return 16  # fallback (won't happen for your 100/600 tiles)
 
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -213,7 +204,7 @@ def save_tile_pair(
     w_s2   = tile_info["s2_window"]
 
     with rasterio.open(emit_path) as emit_ds, rasterio.open(s2_path) as s2_ds:
-        emit_tile = emit_ds.read(window=w_emit) 
+        emit_tile = emit_ds.read(window=w_emit)   # (bands, H, W)
         s2_tile   = s2_ds.read(window=w_s2)
 
         if emit_tile.size == 0:
@@ -228,6 +219,7 @@ def save_tile_pair(
         emit_ds_tags   = emit_ds.tags()
         emit_band_tags = [emit_ds.tags(i) for i in range(1, emit_ds.count + 1)]
 
+        # --- EMIT: float -> uint16 (scaled) ---
         emit = emit_tile.astype(np.float32, copy=False)
 
         valid = np.isfinite(emit)
@@ -281,6 +273,7 @@ def save_tile_pair(
             tiled=bool(tiled),
         )
 
+        # If tiling, set block sizes (keep it dead simple)
         if tiled:
             emit_profile.update(blockxsize=min(e_blk, ew), blockysize=min(e_blk, eh))
             s2_profile.update(blockxsize=min(s_blk, sw), blockysize=min(s_blk, sh))
@@ -297,3 +290,54 @@ def save_tile_pair(
             dst_s.write(s2_tile)
 
     return emit_out, s2_out
+
+
+
+def _subsample_bands_evenly(num_bands_total, num_keep=32):
+    """Pick evenly spaced band indices (needed for EMIT) [0..num_bands_total-1]."""
+    idx = np.linspace(0, num_bands_total - 1, num_keep).round().astype(int)
+    idx = np.unique(idx)
+
+    while len(idx) < num_keep:
+        missing = num_keep - len(idx)
+        add = []
+        for i in range(len(idx) - 1):
+            if len(add) >= missing:
+                break
+            mid = (idx[i] + idx[i + 1]) // 2
+            add.append(int(mid))
+        idx = np.unique(np.concatenate([idx, np.array(add, dtype=int)]))
+    return idx[:num_keep]
+
+def write_emit_b32_tile(emit_tile_path: Path, *, num_keep=32, idx_0based=None, overwrite=True):
+    emit_tile_path = Path(emit_tile_path)
+    out = emit_tile_path.with_name(emit_tile_path.stem + f"_b{num_keep}.tif")
+
+    with rasterio.open(emit_tile_path) as src:
+        if idx_0based is None:
+            if src.count < num_keep:
+                raise ValueError(f"Tile has only {src.count} bands, can't keep {num_keep}.")
+            idx_0based = _subsample_bands_evenly(src.count, num_keep=num_keep)
+        idx_0based = np.asarray(idx_0based, dtype=int)
+
+        # If file exists and we’re not overwriting, still return consistent idx
+        if out.exists() and not overwrite:
+            return out, idx_0based
+
+        profile = src.profile.copy()
+        profile.update(count=len(idx_0based))
+
+        # Optional: enforce training-friendly GeoTIFF settings (only if you want to guarantee them)
+        # profile.update(driver="GTiff", tiled=True, compress="DEFLATE", predictor=2, zlevel=1)
+
+        data = src.read((idx_0based + 1).tolist())
+        with rasterio.open(out, "w", **profile) as dst:
+            dst.write(data)
+
+            desc = list(src.descriptions)
+            for out_i, src0 in enumerate(idx_0based, start=1):
+                d = desc[src0] if src0 < len(desc) else None
+                if d:
+                    dst.set_band_description(out_i, d)
+
+    return out, idx_0based
