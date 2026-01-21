@@ -163,21 +163,41 @@ def find_valid_paired_tiles(
         return tiles
 
 
-def _block_multiple_of_16(desired, dim):
-    # choose a block size <= dim, rounded DOWN to multiple of 16 (min 16)
-    b = min(desired, dim)
-    b = (b // 16) * 16
-    return max(16, b)
+from pathlib import Path
+import numpy as np
+import rasterio
+from rasterio.windows import transform as window_transform
+
+
+from pathlib import Path
+import numpy as np
+import rasterio
+from rasterio.windows import transform as window_transform
 
 def save_tile_pair(
     emit_path,
     s2_path,
     tile_info,
     out_dir,
-    tiled=True,           # <-- you control internal tiling here
-    emit_block=100,        # desired internal block size (will snap to multiple-of-16)
-    s2_block=600,
+    *,
+    tiled=True,
+    overwrite=True,
+    emit_scale=10000.0,      
+    emit_nodata_u16=65535,
+    compress="DEFLATE",
+    zlevel=1,
+    num_threads="ALL_CPUS",
 ):
+
+    def _auto_block_size(width: int, height: int) -> int:
+        #smaller tiles -> 64, larger -> 256.
+        m = min(width, height)
+        if m >= 256:
+            return 256
+        if m >= 64:
+            return 64
+        return 16  
+
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     k = int(tile_info["idx"])
@@ -185,39 +205,21 @@ def save_tile_pair(
     emit_out = out_dir / f"tile_{k:03d}_emit.tif"
     s2_out   = out_dir / f"tile_{k:03d}_s2.tif"
 
-    # remove existing outputs (prevents the “corrupt tif prevents overwrite” issue)
-    emit_out.unlink(missing_ok=True)
-    s2_out.unlink(missing_ok=True)
+    if overwrite:
+        emit_out.unlink(missing_ok=True)
+        s2_out.unlink(missing_ok=True)
+
+    w_emit = tile_info["emit_window"]
+    w_s2   = tile_info["s2_window"]
 
     with rasterio.open(emit_path) as emit_ds, rasterio.open(s2_path) as s2_ds:
-        w_emit = tile_info["emit_window"]
-        w_s2   = tile_info["s2_window"]
-
-        emit_tile = emit_ds.read(window=w_emit)
+        emit_tile = emit_ds.read(window=w_emit) 
         s2_tile   = s2_ds.read(window=w_s2)
 
-        if emit_tile.shape[1] == 0 or emit_tile.shape[2] == 0:
+        if emit_tile.size == 0:
             raise ValueError(f"Empty EMIT tile idx={k}, window={w_emit}")
-        if s2_tile.shape[1] == 0 or s2_tile.shape[2] == 0:
+        if s2_tile.size == 0:
             raise ValueError(f"Empty S2 tile idx={k}, window={w_s2}")
-
-        import numpy as np
-
-        # --- Force EMIT to uint16 + DEFLATE ---
-        emit_scale = 10000.0
-        emit_nodata_uint16 = np.uint16(65535)
-
-        valid = np.isfinite(emit_tile)
-
-        if emit_ds.nodata is not None:
-            valid &= (emit_tile != emit_ds.nodata)
-
-        emit_tile_16 = np.full(emit_tile.shape, emit_nodata_uint16, dtype=np.uint16)
-
-        scaled = np.clip(np.rint(emit_tile * emit_scale), 0, 65534).astype(np.uint16)
-        emit_tile_16[valid] = scaled[valid]
-        emit_tile = emit_tile_16
-
 
         emit_transform = window_transform(w_emit, emit_ds.transform)
         s2_transform   = window_transform(w_s2,   s2_ds.transform)
@@ -226,62 +228,65 @@ def save_tile_pair(
         emit_ds_tags   = emit_ds.tags()
         emit_band_tags = [emit_ds.tags(i) for i in range(1, emit_ds.count + 1)]
 
-        # Build fresh GTiff profiles (don’t inherit ENVI block sizes)
-        eh, ew = emit_tile.shape[1], emit_tile.shape[2]
+        emit = emit_tile.astype(np.float32, copy=False)
+
+        valid = np.isfinite(emit)
+        if emit_ds.nodata is not None:
+            valid &= (emit != emit_ds.nodata)
+
+        scaled_i32 = np.rint(emit * float(emit_scale)).astype(np.int32, copy=False)
+        # keep within uint16 range, reserve 65535 as nodata
+        scaled_i32 = np.clip(scaled_i32, 0, int(emit_nodata_u16) - 1)
+
+        emit_u16 = np.full(emit.shape, int(emit_nodata_u16), dtype=np.uint16)
+        emit_u16[valid] = scaled_i32[valid].astype(np.uint16, copy=False)
+
+        eh, ew = emit_u16.shape[1], emit_u16.shape[2]
         sh, sw = s2_tile.shape[1], s2_tile.shape[2]
+
+        # Auto block sizes (simple + sane)
+        e_blk = _auto_block_size(ew, eh)
+        s_blk = _auto_block_size(sw, sh)
 
         emit_profile = dict(
             driver="GTiff",
             height=eh, width=ew,
-            count=emit_tile.shape[0],
+            count=emit_u16.shape[0],
             dtype="uint16",
             crs=emit_ds.crs,
             transform=emit_transform,
-            nodata=int(emit_nodata_uint16),
-            compress="DEFLATE",
-            predictor=2,
+            nodata=int(emit_nodata_u16),
+            compress=compress,
+            predictor=2,                  # good for integers
+            ZLEVEL=int(zlevel),
             BIGTIFF="IF_SAFER",
+            NUM_THREADS=str(num_threads),
             tiled=bool(tiled),
-            NUM_THREADS= "ALL_CPUS",
-            ZLEVEL= 1
         )
 
+        s2_is_int = np.issubdtype(s2_tile.dtype, np.integer)
         s2_profile = dict(
             driver="GTiff",
             height=sh, width=sw,
             count=s2_tile.shape[0],
-            dtype=s2_tile.dtype,
+            dtype=str(s2_tile.dtype),
             crs=s2_ds.crs,
             transform=s2_transform,
             nodata=s2_ds.nodata,
-            compress="DEFLATE",
-            predictor=2,
+            compress=compress,
+            predictor=2 if s2_is_int else 3,
+            ZLEVEL=int(zlevel),
             BIGTIFF="IF_SAFER",
+            NUM_THREADS=str(num_threads),
             tiled=bool(tiled),
-            NUM_THREADS= "ALL_CPUS",
-            ZLEVEL= 1
         )
 
-        # If internal tiling requested, set valid block sizes (multiples of 16)
         if tiled:
-            if ew < 16 or eh < 16 or sw < 16 or sh < 16:
-                # Too small for tiled GeoTIFF in this environment
-                raise ValueError(
-                    f"Tile too small for tiled GeoTIFF (need >=16px). "
-                    f"EMIT={ew}x{eh}, S2={sw}x{sh}"
-                )
-
-            emit_profile.update(
-                blockxsize=_block_multiple_of_16(emit_block, ew),
-                blockysize=_block_multiple_of_16(emit_block, eh),
-            )
-            s2_profile.update(
-                blockxsize=_block_multiple_of_16(s2_block, sw),
-                blockysize=_block_multiple_of_16(s2_block, sh),
-            )
+            emit_profile.update(blockxsize=min(e_blk, ew), blockysize=min(e_blk, eh))
+            s2_profile.update(blockxsize=min(s_blk, sw), blockysize=min(s_blk, sh))
 
         with rasterio.open(emit_out, "w", **emit_profile) as dst_e:
-            dst_e.write(emit_tile)
+            dst_e.write(emit_u16)
             if emit_ds_tags:
                 dst_e.update_tags(**emit_ds_tags)
             for i, bt in enumerate(emit_band_tags, start=1):
@@ -292,52 +297,3 @@ def save_tile_pair(
             dst_s.write(s2_tile)
 
     return emit_out, s2_out
-
-def _subsample_bands_evenly(num_bands_total, num_keep=32):
-    """Pick evenly spaced band indices (needed for EMIT) [0..num_bands_total-1]."""
-    idx = np.linspace(0, num_bands_total - 1, num_keep).round().astype(int)
-    idx = np.unique(idx)
-
-    while len(idx) < num_keep:
-        missing = num_keep - len(idx)
-        add = []
-        for i in range(len(idx) - 1):
-            if len(add) >= missing:
-                break
-            mid = (idx[i] + idx[i + 1]) // 2
-            add.append(int(mid))
-        idx = np.unique(np.concatenate([idx, np.array(add, dtype=int)]))
-    return idx[:num_keep]
-
-def write_emit_b32_tile(emit_tile_path: Path, *, num_keep=32, idx_0based=None, overwrite=True):
-    emit_tile_path = Path(emit_tile_path)
-    out = emit_tile_path.with_name(emit_tile_path.stem + f"_b{num_keep}.tif")
-
-    with rasterio.open(emit_tile_path) as src:
-        if idx_0based is None:
-            if src.count < num_keep:
-                raise ValueError(f"Tile has only {src.count} bands, can't keep {num_keep}.")
-            idx_0based = _subsample_bands_evenly(src.count, num_keep=num_keep)
-        idx_0based = np.asarray(idx_0based, dtype=int)
-
-        # If file exists and we’re not overwriting, still return consistent idx
-        if out.exists() and not overwrite:
-            return out, idx_0based
-
-        profile = src.profile.copy()
-        profile.update(count=len(idx_0based))
-
-        # Optional: enforce training-friendly GeoTIFF settings (only if you want to guarantee them)
-        # profile.update(driver="GTiff", tiled=True, compress="DEFLATE", predictor=2, zlevel=1)
-
-        data = src.read((idx_0based + 1).tolist())
-        with rasterio.open(out, "w", **profile) as dst:
-            dst.write(data)
-
-            desc = list(src.descriptions)
-            for out_i, src0 in enumerate(idx_0based, start=1):
-                d = desc[src0] if src0 < len(desc) else None
-                if d:
-                    dst.set_band_description(out_i, d)
-
-    return out, idx_0based
