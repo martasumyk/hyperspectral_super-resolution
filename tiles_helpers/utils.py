@@ -3,172 +3,10 @@ import numpy as np
 from pathlib import Path
 import matplotlib.pyplot as plt
 from rasterio.windows import Window
-from rasterio.windows import from_bounds, transform as win_transform
+from rasterio.windows import from_bounds, transform as window_transform
 
 
-
-def compute_invalid_mask(tile, nodata, zero_threshold=1e-6):
-    """
-    tile: (bands, H, W)
-
-    Returns mask (H, W) where pixels are considered invalid:
-      - all bands ~= nodata, OR
-      - all bands are very close to 0
-    """
-    if nodata is not None:
-        is_nodata = np.all(np.isclose(tile, nodata, atol=zero_threshold), axis=0)
-    else:
-        is_nodata = np.zeros(tile.shape[1:], dtype=bool)
-
-    is_zero = np.all(np.abs(tile) < zero_threshold, axis=0)
-    invalid = is_nodata | is_zero
-    return invalid
-
-
-def is_black_mask(arr, nodata=None):
-    """
-    arr: (bands, H, W)
-    Returns a boolean (H, W) mask where pixels are 'black'.
-    - If nodata is given: pixel is black if *all* bands == nodata
-    - Else: pixel is black if *all* bands == 0
-    """
-    if nodata is not None:
-        return np.all(arr == nodata, axis=0)
-    else:
-        return np.all(arr == 0, axis=0)
-
-
-
-def make_paired_tiles(
-    emit_path,
-    s2_path,
-    out_root,
-    emit_tile_size=100,
-    overlap_frac=0.1,
-    max_invalid_frac=1,
-    zero_threshold=1e-6,
-):
-    """
-    Create paired tiles:
-      - EMIT tile: emit_tile_size x emit_tile_size   (e.g. 100 x 100)
-      - S2 tile:   (emit_tile_size * scale)²        (e.g. 600 x 600 if scale=6)
-
-    overlap_frac: e.g., 0.1 -> 10% overlap → stride = 0.9 * tile size
-    max_invalid_frac: max fraction of invalid (black/nodata) pixels allowed
-                      separately for EMIT and S2. If either exceeds this threshold,
-                      the tile is skipped.
-    """
-    out_root = Path(out_root)
-    out_emit_dir = out_root / "emit_tiles"
-    out_s2_dir   = out_root / "s2_tiles"
-    out_emit_dir.mkdir(parents=True, exist_ok=True)
-    out_s2_dir.mkdir(parents=True, exist_ok=True)
-
-    with rasterio.open(emit_path) as e_ds, rasterio.open(s2_path) as s_ds:
-        assert e_ds.crs == s_ds.crs, "CRS mismatch between EMIT and S2"
-
-        e_res = abs(e_ds.transform.a) 
-        s_res = abs(s_ds.transform.a)
-
-        scale_float = e_res / s_res
-        scale = int(round(scale_float))
-        print(f"Pixel sizes: EMIT={e_res}, S2={s_res}, scale≈{scale_float:.2f}")
-
-        if scale <= 0 or abs(scale_float - scale) > 0.1:
-            raise ValueError(
-                f"EMIT/S2 resolutions not a near-integer factor (got {scale_float:.2f}). "
-                "Check that EMIT is coarser than S2."
-            )
-
-        s2_tile_size = emit_tile_size * scale
-
-        emit_stride = int(emit_tile_size * (1 - overlap_frac))
-        s2_stride   = emit_stride * scale
-
-        e_h, e_w = e_ds.height, e_ds.width
-        s_h, s_w = s_ds.height, s_ds.width
-
-        print(f"EMIT size: {e_w} x {e_h}")
-        print(f"S2   size: {s_w} x {s_h}")
-        print(f"Tile sizes: EMIT={emit_tile_size}, S2={s2_tile_size}")
-        print(f"Strides:    EMIT={emit_stride}, S2={s2_stride}")
-        print(f"max_invalid_frac={max_invalid_frac}")
-
-        emit_nodata = e_ds.nodata
-        s2_nodata   = s_ds.nodata
-
-        emit_ds_tags   = e_ds.tags()
-        emit_band_tags = [e_ds.tags(i) for i in range(1, e_ds.count + 1)]
-        s2_ds_tags     = s_ds.tags()
-
-        tile_id = 0
-        kept = 0
-
-        for er in range(0, e_h - emit_tile_size + 1, emit_stride):
-            for ec in range(0, e_w - emit_tile_size + 1, emit_stride):
-                sr = er * scale
-                sc = ec * scale
-
-                if sr + s2_tile_size > s_h or sc + s2_tile_size > s_w:
-                    tile_id += 1
-                    continue
-
-                emit_win = Window(ec, er, emit_tile_size, emit_tile_size)
-                s2_win   = Window(sc, sr, s2_tile_size, s2_tile_size)
-
-                emit_tile = e_ds.read(window=emit_win)   # (bands, 100, 100)
-                s2_tile   = s_ds.read(window=s2_win)     # (bands, 600, 600)
-
-                inv_emit = compute_invalid_mask(emit_tile, emit_nodata, zero_threshold)
-                inv_s2   = compute_invalid_mask(s2_tile, s2_nodata, zero_threshold)
-
-                invalid_emit_frac = float(inv_emit.mean())
-                invalid_s2_frac   = float(inv_s2.mean())
-
-                if (invalid_emit_frac > max_invalid_frac) or (invalid_s2_frac > max_invalid_frac):
-                    tile_id += 1
-                    continue
-
-                emit_profile = e_ds.profile.copy()
-                emit_profile.update({
-                    "height": emit_tile_size,
-                    "width":  emit_tile_size,
-                    "transform": win_transform(emit_win, e_ds.transform),
-                })
-
-                emit_fname = out_emit_dir / f"emit_tile_{tile_id:05d}.bin"
-                with rasterio.open(emit_fname, "w", **emit_profile) as dst:
-                    dst.write(emit_tile)
-                    dst.update_tags(**emit_ds_tags)
-                    for i, bt in enumerate(emit_band_tags, start=1):
-                        if bt:
-                            dst.update_tags(i, **bt)
-
-                s2_profile = s_ds.profile.copy()
-                s2_profile.update({
-                    "height": s2_tile_size,
-                    "width":  s2_tile_size,
-                    "transform": win_transform(s2_win, s_ds.transform),
-                })
-
-                s2_fname = out_s2_dir / f"s2_tile_{tile_id:05d}.tif"
-                with rasterio.open(s2_fname, "w", **s2_profile) as dst:
-                    dst.write(s2_tile)
-                    dst.update_tags(**s2_ds_tags)
-
-                kept += 1
-                tile_id += 1
-
-        print(f"Done. Kept {kept} tiles (max_invalid_frac={max_invalid_frac}).")
-        return out_emit_dir, out_s2_dir
-
-
-
-
-def plot_tile_pair_simple(emit_tile_path, s2_tile_path, title_suffix=""):
-    """
-    Plot one pair of perfectly matching (geometrically) tiles.
-    """
+def plot_tile_pair_simple(emit_tile_path, s2_tile_path, title_suffix="", save_path=None, show=True):
     emit_tile_path = Path(emit_tile_path)
     s2_tile_path   = Path(s2_tile_path)
 
@@ -206,4 +44,251 @@ def plot_tile_pair_simple(emit_tile_path, s2_tile_path, title_suffix=""):
         ax2.axis("off")
 
     plt.tight_layout()
-    plt.show()
+
+    if save_path is not None:
+        save_path = Path(save_path)
+        save_path.parent.mkdir(parents=True, exist_ok=True)
+        fig.savefig(save_path, dpi=150, bbox_inches="tight")
+
+    if show:
+        plt.show()
+
+    plt.close(fig)
+
+
+def is_black_mask(arr, nodata=None, masked_val=-0.01,
+                  nodata_atol=1e-3, zero_atol=1e-6):
+    """
+    arr: (bands, H, W)
+
+    Pixel is 'black/invalid' if:
+      - all bands ≈ nodata          (e.g. -9999)
+      - OR all bands ≈ masked_val   (EMIT masked reflectance, ~ -0.01)
+      - OR all bands ≈ 0            (true black)
+    """
+    if nodata is not None:
+        nodata_mask = np.all(np.isclose(arr, nodata, atol=nodata_atol), axis=0)
+    else:
+        nodata_mask = np.zeros(arr.shape[1:], dtype=bool)
+
+    masked_mask = np.all(np.isclose(arr, masked_val, atol=nodata_atol), axis=0)
+
+    zero_mask = np.all(np.abs(arr) < zero_atol, axis=0)
+
+    return nodata_mask | masked_mask | zero_mask
+
+
+def find_valid_paired_tiles(
+    emit_path,
+    s2_path,
+    emit_tile_size=100,
+    scale=6,
+    max_black_frac=0.0,
+    max_tiles=None
+):
+    """
+    Iterate over EMIT and S2 in paired tiles.
+    Assumes:
+      - EMIT and S2 cover the same area
+      - spatial resolution ratio = `scale` (S2 is finer)
+      - S2 height/width ≈ scale * EMIT height/width
+    Returns a list of tile descriptors:
+      [ { 'emit_window': Window, 's2_window': Window, 'idx': k }, ... ]
+    """
+
+    tiles = []
+
+    with rasterio.open(emit_path) as emit_ds, rasterio.open(s2_path) as s2_ds:
+        h_e, w_e = emit_ds.height, emit_ds.width
+        h_s, w_s = s2_ds.height, s2_ds.width
+
+        ratio_h = h_s / h_e
+        ratio_w = w_s / w_e
+        print(f"EMIT shape: {h_e}x{w_e}, S2 shape: {h_s}x{w_s}")
+        print(f"Pixel ratio (h, w): {ratio_h:.3f}, {ratio_w:.3f}")
+
+
+        emit_nodata = emit_ds.nodata
+        s2_nodata = s2_ds.nodata
+
+        tile_h_e = emit_tile_size
+        tile_w_e = emit_tile_size
+        tile_h_s = tile_h_e * scale
+        tile_w_s = tile_w_e * scale
+
+        idx = 0
+
+        step_y = tile_h_e
+        step_x = tile_w_e
+
+        for row_e in range(0, h_e - tile_h_e + 1, step_y):
+            for col_e in range(0, w_e - tile_w_e + 1, step_x):
+
+
+                row_s = row_e * scale
+                col_s = col_e * scale
+
+                if (row_s + tile_h_s > h_s) or (col_s + tile_w_s > w_s):
+                    continue
+
+                w_emit = Window(col_e, row_e, tile_w_e, tile_h_e)
+                w_s2   = Window(col_s, row_s, tile_w_s, tile_h_s)
+
+                emit_tile = emit_ds.read(window=w_emit)
+                s2_tile   = s2_ds.read(window=w_s2)
+
+                emit_black = is_black_mask(emit_tile, nodata=emit_nodata)
+                s2_black   = is_black_mask(s2_tile, nodata=s2_nodata)
+
+                emit_black_frac = emit_black.sum() / emit_black.size
+                s2_black_frac   = s2_black.sum() / s2_black.size
+
+                if (emit_black_frac <= max_black_frac) and (s2_black_frac <= max_black_frac):
+                    tiles.append(
+                        {
+                            "idx": idx,
+                            "emit_window": w_emit,
+                            "s2_window": w_s2,
+                            "emit_black_frac": emit_black_frac,
+                            "s2_black_frac": s2_black_frac,
+                        }
+                    )
+                    idx += 1
+
+                    if max_tiles is not None and len(tiles) >= max_tiles:
+                        print(f"Collected {len(tiles)} tiles, stopping.")
+                        return tiles
+
+        print(f"Total valid tiles found: {len(tiles)}")
+        return tiles
+
+
+def _block_multiple_of_16(desired, dim):
+    # choose a block size <= dim, rounded DOWN to multiple of 16 (min 16)
+    b = min(desired, dim)
+    b = (b // 16) * 16
+    return max(16, b)
+
+def save_tile_pair(
+    emit_path,
+    s2_path,
+    tile_info,
+    out_dir,
+    tiled=True,           # <-- you control internal tiling here
+    emit_block=100,        # desired internal block size (will snap to multiple-of-16)
+    s2_block=600,
+):
+    out_dir = Path(out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    k = int(tile_info["idx"])
+
+    emit_out = out_dir / f"tile_{k:03d}_emit.tif"
+    s2_out   = out_dir / f"tile_{k:03d}_s2.tif"
+
+    # remove existing outputs (prevents the “corrupt tif prevents overwrite” issue)
+    emit_out.unlink(missing_ok=True)
+    s2_out.unlink(missing_ok=True)
+
+    with rasterio.open(emit_path) as emit_ds, rasterio.open(s2_path) as s2_ds:
+        w_emit = tile_info["emit_window"]
+        w_s2   = tile_info["s2_window"]
+
+        emit_tile = emit_ds.read(window=w_emit)
+        s2_tile   = s2_ds.read(window=w_s2)
+
+        if emit_tile.shape[1] == 0 or emit_tile.shape[2] == 0:
+            raise ValueError(f"Empty EMIT tile idx={k}, window={w_emit}")
+        if s2_tile.shape[1] == 0 or s2_tile.shape[2] == 0:
+            raise ValueError(f"Empty S2 tile idx={k}, window={w_s2}")
+
+        import numpy as np
+
+        # --- Force EMIT to uint16 + DEFLATE ---
+        emit_scale = 10000.0
+        emit_nodata_uint16 = np.uint16(65535)
+
+        valid = np.isfinite(emit_tile)
+
+        if emit_ds.nodata is not None:
+            valid &= (emit_tile != emit_ds.nodata)
+
+        emit_tile_16 = np.full(emit_tile.shape, emit_nodata_uint16, dtype=np.uint16)
+
+        scaled = np.clip(np.rint(emit_tile * emit_scale), 0, 65534).astype(np.uint16)
+        emit_tile_16[valid] = scaled[valid]
+        emit_tile = emit_tile_16
+
+
+        emit_transform = window_transform(w_emit, emit_ds.transform)
+        s2_transform   = window_transform(w_s2,   s2_ds.transform)
+
+        # Preserve EMIT tags
+        emit_ds_tags   = emit_ds.tags()
+        emit_band_tags = [emit_ds.tags(i) for i in range(1, emit_ds.count + 1)]
+
+        # Build fresh GTiff profiles (don’t inherit ENVI block sizes)
+        eh, ew = emit_tile.shape[1], emit_tile.shape[2]
+        sh, sw = s2_tile.shape[1], s2_tile.shape[2]
+
+        emit_profile = dict(
+            driver="GTiff",
+            height=eh, width=ew,
+            count=emit_tile.shape[0],
+            dtype="uint16",
+            crs=emit_ds.crs,
+            transform=emit_transform,
+            nodata=int(emit_nodata_uint16),
+            compress="DEFLATE",
+            predictor=2,
+            BIGTIFF="IF_SAFER",
+            tiled=bool(tiled),
+            NUM_THREADS= "ALL_CPUS",
+            ZLEVEL= 1
+        )
+
+        s2_profile = dict(
+            driver="GTiff",
+            height=sh, width=sw,
+            count=s2_tile.shape[0],
+            dtype=s2_tile.dtype,
+            crs=s2_ds.crs,
+            transform=s2_transform,
+            nodata=s2_ds.nodata,
+            compress="DEFLATE",
+            predictor=2,
+            BIGTIFF="IF_SAFER",
+            tiled=bool(tiled),
+            NUM_THREADS= "ALL_CPUS",
+            ZLEVEL= 1
+        )
+
+        # If internal tiling requested, set valid block sizes (multiples of 16)
+        if tiled:
+            if ew < 16 or eh < 16 or sw < 16 or sh < 16:
+                # Too small for tiled GeoTIFF in this environment
+                raise ValueError(
+                    f"Tile too small for tiled GeoTIFF (need >=16px). "
+                    f"EMIT={ew}x{eh}, S2={sw}x{sh}"
+                )
+
+            emit_profile.update(
+                blockxsize=_block_multiple_of_16(emit_block, ew),
+                blockysize=_block_multiple_of_16(emit_block, eh),
+            )
+            s2_profile.update(
+                blockxsize=_block_multiple_of_16(s2_block, sw),
+                blockysize=_block_multiple_of_16(s2_block, sh),
+            )
+
+        with rasterio.open(emit_out, "w", **emit_profile) as dst_e:
+            dst_e.write(emit_tile)
+            if emit_ds_tags:
+                dst_e.update_tags(**emit_ds_tags)
+            for i, bt in enumerate(emit_band_tags, start=1):
+                if bt:
+                    dst_e.update_tags(i, **bt)
+
+        with rasterio.open(s2_out, "w", **s2_profile) as dst_s:
+            dst_s.write(s2_tile)
+
+    return emit_out, s2_out

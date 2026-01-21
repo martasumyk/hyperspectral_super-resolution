@@ -13,6 +13,7 @@ import rasterio
 from rasterio.warp import transform_bounds
 
 import pandas as pd
+import numpy as np
 
 
 # -----------------------------------------------------------------------------
@@ -691,3 +692,48 @@ def write_archive_map(path: str | Path, mapping: dict[str, Any], *, report: Repo
         )
 
     return path
+
+
+def describe_tif(path):
+    path = Path(path)
+    if not path.exists():
+        print(f"[ERROR] Not found: {path}")
+        return
+
+    with rasterio.open(path) as ds:
+        print("=" * 80)
+        print("FILE:", str(path))
+        print("Driver:", ds.driver)
+        print("Size (W x H):", ds.width, "x", ds.height)
+        print("Bands:", ds.count)
+        print("CRS:", ds.crs)
+        print("Res:", ds.res)
+        print("Nodata:", ds.nodata)
+
+        # Dtypes / bits
+        dtypes = ds.dtypes  # list per band
+        uniq = sorted(set(dtypes))
+        print("\nDtype(s):", uniq)
+
+        # bit depth per dtype
+        bits = {dt: int(np.dtype(dt).itemsize * 8) for dt in uniq}
+        print("Bit depth(s):", {dt: bits[dt] for dt in uniq})
+
+        if len(uniq) == 1:
+            print("Bit depth (all bands):", bits[uniq[0]])
+        else:
+            print("Bit depth per band:", [bits[dt] for dt in dtypes])
+
+        # Compression / tiling
+        comp = ds.profile.get("compress", None) or ds.profile.get("compression", None)
+        print("\nCompression:", comp if comp else "NONE/UNSPECIFIED")
+
+        tiled = ds.profile.get("tiled", None)
+        blockx = ds.profile.get("blockxsize", None)
+        blocky = ds.profile.get("blockysize", None)
+        print("Tiled:", tiled)
+        if blockx and blocky:
+            print("Block size:", blockx, "x", blocky)
+
+        # Pixel interleave / layout (sometimes helpful)
+        print("Profile keys:", {k: ds.profile.get(k) for k in ["dtype", "count", "interleave", "bigtiff", "driver"]})

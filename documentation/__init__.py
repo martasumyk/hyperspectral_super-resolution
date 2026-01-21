@@ -9,7 +9,7 @@ from .pairs_artifacts import (
     bounds_from_bbox, centroid_from_bounds, pick_s2_assets_minimal, 
     write_s2_metadata, tif_geo_summary, TileRecord, 
     write_tile_metadata, write_manifest_csv, 
-    copy_any, write_archive_map
+    copy_any, write_archive_map, describe_tif
 
 )
 
@@ -20,5 +20,5 @@ __all__ = [
     'bounds_from_bbox', 'centroid_from_bounds', 'pick_s2_assets_minimal', 
     'write_s2_metadata', 'tif_geo_summary', 'TileRecord', 
     'write_tile_metadata', 'write_manifest_csv', 
-    'copy_any', 'write_archive_map'
+    'copy_any', 'write_archive_map', 'describe_tif'
 ]
