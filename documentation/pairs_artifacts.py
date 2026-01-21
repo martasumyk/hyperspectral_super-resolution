@@ -518,6 +518,9 @@ class TileRecord:
     emit_window: Optional[dict] = None
     s2_window: Optional[dict] = None
 
+    emit_b32_tif: str | None = None
+    emit_b32_indices_0based: list[int] | None = None
+
     def to_manifest_row(self) -> dict:
         row = {
             "idx": int(self.idx),
@@ -526,6 +529,7 @@ class TileRecord:
             "plot_png": self.plot_png,
             "emit_black_frac": self.emit_black_frac,
             "s2_black_frac": self.s2_black_frac,
+            "emit_b32_tif": self.emit_b32_tif,
         }
 
         def _pull(prefix: str, g: Optional[dict]):
@@ -583,6 +587,7 @@ def write_tile_metadata(
             "emit_tif": record.emit_tif,
             "s2_tif": record.s2_tif,
             "plot_png": record.plot_png,
+            "emit_b32_tif": record.emit_b32_tif
         },
         "tile_info": tile_info or {},
     }

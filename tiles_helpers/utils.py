@@ -292,3 +292,52 @@ def save_tile_pair(
             dst_s.write(s2_tile)
 
     return emit_out, s2_out
+
+def _subsample_bands_evenly(num_bands_total, num_keep=32):
+    """Pick evenly spaced band indices (needed for EMIT) [0..num_bands_total-1]."""
+    idx = np.linspace(0, num_bands_total - 1, num_keep).round().astype(int)
+    idx = np.unique(idx)
+
+    while len(idx) < num_keep:
+        missing = num_keep - len(idx)
+        add = []
+        for i in range(len(idx) - 1):
+            if len(add) >= missing:
+                break
+            mid = (idx[i] + idx[i + 1]) // 2
+            add.append(int(mid))
+        idx = np.unique(np.concatenate([idx, np.array(add, dtype=int)]))
+    return idx[:num_keep]
+
+def write_emit_b32_tile(emit_tile_path: Path, *, num_keep=32, idx_0based=None, overwrite=True):
+    emit_tile_path = Path(emit_tile_path)
+    out = emit_tile_path.with_name(emit_tile_path.stem + f"_b{num_keep}.tif")
+
+    with rasterio.open(emit_tile_path) as src:
+        if idx_0based is None:
+            if src.count < num_keep:
+                raise ValueError(f"Tile has only {src.count} bands, can't keep {num_keep}.")
+            idx_0based = _subsample_bands_evenly(src.count, num_keep=num_keep)
+        idx_0based = np.asarray(idx_0based, dtype=int)
+
+        # If file exists and we’re not overwriting, still return consistent idx
+        if out.exists() and not overwrite:
+            return out, idx_0based
+
+        profile = src.profile.copy()
+        profile.update(count=len(idx_0based))
+
+        # Optional: enforce training-friendly GeoTIFF settings (only if you want to guarantee them)
+        # profile.update(driver="GTiff", tiled=True, compress="DEFLATE", predictor=2, zlevel=1)
+
+        data = src.read((idx_0based + 1).tolist())
+        with rasterio.open(out, "w", **profile) as dst:
+            dst.write(data)
+
+            desc = list(src.descriptions)
+            for out_i, src0 in enumerate(idx_0based, start=1):
+                d = desc[src0] if src0 < len(desc) else None
+                if d:
+                    dst.set_band_description(out_i, d)
+
+    return out, idx_0based
