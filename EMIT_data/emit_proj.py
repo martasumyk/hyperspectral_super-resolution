@@ -364,6 +364,182 @@ def _compute_te(src_path, s2_bounds, out_crs, xres=60.0, yres=60.0):
     return inter_snapped
 
 
+import math
+import shutil
+import numpy as np
+import rasterio
+from rasterio.enums import Resampling
+
+def _which_gdal_edit() -> str | None:
+    for c in ("gdal_edit", "gdal_edit.py"):
+        if shutil.which(c):
+            return c
+    return None
+
+
+def export_loc_uint16_deflate_geotiff(
+    src_path: str,
+    dst_tif: str,
+    *,
+    lon_range=(-180.0, 180.0),
+    lat_range=(-90.0, 90.0),
+    elev_range=(-1000.0, 12000.0),
+    nodata_uint16: int = 0,
+) -> dict:
+    """
+    Export EMIT LOC (lon,lat,elev) to UInt16 GeoTIFF with meaningful scaling.
+    Writes per-band scale/offset metadata when gdal_edit is available.
+    """
+    # Per-band scaling using -scale_X (aka -scale_bn) :contentReference[oaicite:3]{index=3}
+    cmd = [
+        "gdal_translate",
+        "-of", "GTiff",
+        "-ot", "UInt16",
+        "-a_nodata", str(nodata_uint16),
+        "-co", "COMPRESS=DEFLATE",
+        "-co", "PREDICTOR=2",
+        "-co", "TILED=YES",
+        # clamp + scale each band
+        "-scale_1", str(lon_range[0]), str(lon_range[1]), "0", "65535",
+        "-exponent_1", "1",
+        "-scale_2", str(lat_range[0]), str(lat_range[1]), "0", "65535",
+        "-exponent_2", "1",
+        "-scale_3", str(elev_range[0]), str(elev_range[1]), "0", "65535",
+        "-exponent_3", "1",
+        src_path, dst_tif,
+    ]
+    rec = run_cmd(cmd, check=True)
+
+    # Store decode metadata: true = raw*scale + offset :contentReference[oaicite:4]{index=4}
+    scales = [
+        (lon_range[1] - lon_range[0]) / 65535.0,
+        (lat_range[1] - lat_range[0]) / 65535.0,
+        (elev_range[1] - elev_range[0]) / 65535.0,
+    ]
+    offsets = [lon_range[0], lat_range[0], elev_range[0]]
+
+    gdal_edit = _which_gdal_edit()
+    if gdal_edit:
+        run_cmd(
+            [gdal_edit, "-scale", *[f"{s:.16g}" for s in scales],
+                       "-offset", *[f"{o:.16g}" for o in offsets],
+             dst_tif],
+            check=True,
+        )
+
+    rec["uint16_decode"] = {
+        "scales": scales,
+        "offsets": offsets,
+        "ranges": [list(lon_range), list(lat_range), list(elev_range)],
+        "nodata_uint16": nodata_uint16,
+        "note": "Recover: true = raw*scale + offset",
+    }
+    return rec
+
+
+def _sample_band_minmax(
+    src_path: str,
+    band_index_1based: int,
+    nodata: float,
+    *,
+    stride: int = 64,
+    p_low: float = 1.0,
+    p_high: float = 99.0,
+) -> tuple[float, float]:
+    """
+    Fast-ish robust min/max from a decimated read (percentiles).
+    """
+    with rasterio.open(src_path) as ds:
+        out_h = max(1, ds.height // stride)
+        out_w = max(1, ds.width // stride)
+        arr = ds.read(
+            band_index_1based,
+            out_shape=(out_h, out_w),
+            resampling=Resampling.nearest,
+        ).astype(np.float32)
+
+    m = np.isfinite(arr) & (arr != float(nodata))
+    if not np.any(m):
+        # fallback: arbitrary small range to avoid gdal_translate failure
+        return 0.0, 1.0
+
+    vals = arr[m]
+    lo, hi = np.percentile(vals, [p_low, p_high])
+    if not np.isfinite(lo) or not np.isfinite(hi) or lo == hi:
+        lo = float(np.min(vals))
+        hi = float(np.max(vals))
+        if lo == hi:
+            hi = lo + 1.0
+    return float(lo), float(hi)
+
+
+def export_obs_uint16_deflate_geotiff(
+    src_path: str,
+    dst_tif: str,
+    *,
+    nodata_float: float,
+    nodata_uint16: int = 0,
+    stride: int = 64,
+    p_low: float = 1.0,
+    p_high: float = 99.0,
+) -> dict:
+    """
+    Export EMIT OBS cube to UInt16 GeoTIFF with per-band robust scaling.
+    Writes per-band scale/offset metadata when gdal_edit is available.
+    """
+    with rasterio.open(src_path) as ds:
+        nb = ds.count
+
+    # build per-band scale args (-scale_X ... -exponent_X 1) :contentReference[oaicite:5]{index=5}
+    cmd = [
+        "gdal_translate",
+        "-of", "GTiff",
+        "-ot", "UInt16",
+        "-a_nodata", str(nodata_uint16),
+        "-co", "COMPRESS=DEFLATE",
+        "-co", "PREDICTOR=2",
+        "-co", "TILED=YES",
+    ]
+
+    src_mins, src_maxs = [], []
+    for b in range(1, nb + 1):
+        lo, hi = _sample_band_minmax(
+            src_path, b, nodata_float,
+            stride=stride, p_low=p_low, p_high=p_high
+        )
+        src_mins.append(lo)
+        src_maxs.append(hi)
+        cmd += [f"-scale_{b}", str(lo), str(hi), "0", "65535", f"-exponent_{b}", "1"]
+
+    cmd += [src_path, dst_tif]
+    rec = run_cmd(cmd, check=True)
+
+    # Store decode metadata per band: true = raw*scale + offset :contentReference[oaicite:6]{index=6}
+    scales = [(mx - mn) / 65535.0 for mn, mx in zip(src_mins, src_maxs)]
+    offsets = list(src_mins)
+
+    gdal_edit = _which_gdal_edit()
+    if gdal_edit:
+        run_cmd(
+            [gdal_edit, "-scale", *[f"{s:.16g}" for s in scales],
+                       "-offset", *[f"{o:.16g}" for o in offsets],
+             dst_tif],
+            check=True,
+        )
+
+    rec["uint16_decode"] = {
+        "scales": scales,
+        "offsets": offsets,
+        "src_mins": src_mins,
+        "src_maxs": src_maxs,
+        "nodata_uint16": nodata_uint16,
+        "note": "Recover: true = raw*scale + offset",
+        "percentiles": [p_low, p_high],
+        "stride": stride,
+    }
+    return rec
+
+
 
 def nc_to_envi(
     img_file: str,
@@ -448,6 +624,31 @@ def nc_to_envi(
             description = "Reflectance (unitless)"
         else:
             raise ValueError("Unrecognized input image dataset (expected 'radiance' or 'reflectance').")
+        
+        # ---- Validate raw dimension order for GLT indexing ----
+        dims = getattr(data, "dimensions", None)  # netCDF4 Variable has .dimensions
+        # Expected: first two dims are (downtrack, crosstrack) in some wording
+        # We'll decide whether we need to transpose raw blocks.
+
+        transpose_raw_yx = False
+        if dims is not None and len(dims) >= 2:
+            d0, d1 = str(dims[0]).lower(), str(dims[1]).lower()
+
+            # Heuristics: EMIT commonly uses "downtrack" and "crosstrack"
+            # If first dim looks like crosstrack and second like downtrack, we must swap.
+            if ("crosstrack" in d0 and "downtrack" in d1) or ("x" == d0 and "y" == d1):
+                transpose_raw_yx = True
+
+            # If neither contains expected tokens, just print for manual verification
+            if ("downtrack" not in d0 and "crosstrack" not in d0 and "along" not in d0 and "across" not in d0) or \
+            ("downtrack" not in d1 and "crosstrack" not in d1 and "along" not in d1 and "across" not in d1):
+                print(f"[WARN] Unclear EMIT raw dims order: {dims}. Assuming data[y,x,...].")
+        else:
+            print("[WARN] data.dimensions not available; assuming data[y,x,...].")
+
+        print(f"[DEBUG] data.dimensions={dims} -> transpose_raw_yx={transpose_raw_yx}")
+        # ------------------------------------------------------
+
 
         sbp = img_nc.groups["sensor_band_parameters"]
         fwhm  = np.asarray(sbp.variables["fwhm"][:])
@@ -455,33 +656,97 @@ def nc_to_envi(
 
         # Geotransform/GLT
         gt = np.array(get_attr(img_nc, "geotransform"))
+
+        # ---- Guard: ENVI map_info cannot represent rotated/sheared geotransforms ----
+        gt = np.asarray(gt, dtype=float)
+        if len(gt) != 6:
+            raise ValueError(f"Expected geotransform of length 6, got {len(gt)}: {gt}")
+
+        if abs(gt[2]) > 1e-12 or abs(gt[4]) > 1e-12:
+            raise ValueError(
+                "Rotated/sheared geotransform detected (gt[2] or gt[4] non-zero). "
+                "ENVI 'map info' cannot represent rotation. "
+                f"gt={gt.tolist()}"
+            )
+        # ---------------------------------------------------------------------------
+
         loc = img_nc.groups["location"]
         glt_x = np.asarray(loc.variables["glt_x"][:])
         glt_y = np.asarray(loc.variables["glt_y"][:])
         glt = np.zeros(list(glt_x.shape) + [2], dtype=np.int32)
-        glt[..., 0] = glt_x
-        glt[..., 1] = glt_y
-        valid_glt = np.all(glt != 0, axis=-1)
-        glt[valid_glt] -= 1
+        glt[..., 0] = np.nan_to_num(glt_x, nan=0).astype(np.int32)
+        glt[..., 1] = np.nan_to_num(glt_y, nan=0).astype(np.int32)
 
-        # ENVI header 'map info' as list
+
+
+        # valid in 1-based GLT space (0 means nodata)
+        valid_glt = np.all(glt != 0, axis=-1)
+
+        # 0-based copy for indexing (safe + no double-decrement risk)
+        glt0 = glt.copy()
+        glt0[valid_glt] -= 1
+
+        raw_h, raw_w = (int(data.shape[1]), int(data.shape[0])) if transpose_raw_yx else (int(data.shape[0]), int(data.shape[1]))
+
+        in_bounds = (
+            (glt0[..., 1] >= 0) & (glt0[..., 1] < raw_h) &
+            (glt0[..., 0] >= 0) & (glt0[..., 0] < raw_w)
+        )
+
+        valid_glt2 = valid_glt & in_bounds
+
+        dropped = int(np.count_nonzero(valid_glt) - np.count_nonzero(valid_glt2))
+        if dropped > 0:
+            pct = 100.0 * dropped / max(1, int(np.count_nonzero(valid_glt)))
+            print(f"[WARN] Dropping {dropped} GLT pixels ({pct:.4f}%) that are out-of-bounds for raw grid {raw_h}x{raw_w}")
+
+            # optional: record diagnostics (only if info already exists at this point)
+            try:
+                info.setdefault("glt_diag", {})
+                info["glt_diag"].update({
+                    "raw_shape_yx": [raw_h, raw_w],
+                    "valid_glt_count": int(np.count_nonzero(valid_glt)),
+                    "valid_glt_inbounds_count": int(np.count_nonzero(valid_glt2)),
+                    "valid_glt_dropped_oob": dropped,
+                })
+            except Exception:
+                pass
+        # ---------------------------------------------------------------
+
+
+        x0 = float(gt[0] + 0.5 * gt[1])
+        y0 = float(gt[3] + 0.5 * gt[5]) 
+
+        H, W = glt.shape[:2]
+
+        x_ul, x_res, x_rot, y_ul, y_rot, y_res = map(float, gt)
+
+        def _xy(col: float, row: float) -> tuple[float, float]:
+            X = x_ul + col * x_res + row * x_rot
+            Y = y_ul + col * y_rot + row * y_res
+            return (X, Y)
+
+        # Outer corners: (0,0), (W,0), (W,H), (0,H)
+        c1 = _xy(0, 0)     # upper-left edge
+        c2 = _xy(W, 0)     # upper-right edge
+        c3 = _xy(W, H)     # lower-right edge
+        c4 = _xy(0, H)     # lower-left edge
+
+        corner_1 = [c1[0], c1[1]]
+        corner_2 = [c2[0], c2[1]]
+        corner_3 = [c3[0], c3[1]]
+        corner_4 = [c4[0], c4[1]]
+        # ---------------------------------------------------------------------------
+
         map_info = [
             "Geographic Lat/Lon",
             1, 1,
-            float(gt[0]), float(gt[3]),
+            x0, y0,
             float(gt[1]), float(-gt[5]),
             "WGS-84",
             "units=degrees",
         ]
 
-        # Extents & time
-        latitude  = np.asarray(loc.variables["lat"][:])
-        longitude = np.asarray(loc.variables["lon"][:])
-
-        corner_1 = [float(longitude[0, 0]), float(latitude[0, 0])]
-        corner_2 = [float(longitude[0, -1]), float(latitude[0, -1])]
-        corner_3 = [float(longitude[-1, -1]), float(latitude[-1, -1])]
-        corner_4 = [float(longitude[-1, 0]), float(latitude[-1, 0])]
 
         t0 = get_attr(img_nc, "time_coverage_start")
         t1 = get_attr(img_nc, "time_coverage_end")
@@ -509,7 +774,7 @@ def nc_to_envi(
         if not out_crs:
             raise ValueError("out_crs is None. Provide s2_tif_path or enable epsg/UTM fallback.")
 
-        tr_args = ["-tr", str(out_ps[0]), str(out_ps[1])] if (match_res and out_ps) else ["-tr", "60", "60"]
+        xres, yres = (float(out_ps[0]), float(out_ps[1])) if match_res else (60.0, 60.0)
 
         ts = start_time.strftime("%Y%m%dT%H%M%S")
         suffix = f"_{tag}" if tag else ""
@@ -527,11 +792,6 @@ def nc_to_envi(
         need_loc  = export_loc and (overwrite or not (loc_utm.exists() and loc_hdr.exists()))
         need_obs  = (obs_file is not None) and (overwrite or not (obs_utm.exists() and obs_hdr.exists()))
 
-        if not (need_data or need_loc or need_obs):
-            print(f"All requested outputs already exist; skipping. Returning: {data_utm}")
-            info["outputs"]["data_envi_bin"] = str(data_utm)
-            return _finalize_and_return(data_utm)
-        
         info = {
             "img_file": img_file,
             "obs_file": str(obs_file) if obs_file else None,
@@ -560,8 +820,35 @@ def nc_to_envi(
             "rasters": {},
         }
 
+        if not (need_data or need_loc or need_obs):
+            print(f"All requested outputs already exist; skipping. Returning: {data_utm}")
 
-        def _run_gdalwarp(src_path: str, dst_path: str, xres = 60.0, yres = 60.0) -> dict:
+            # record what already exists (requested outputs)
+            info["outputs"]["data_envi_bin"] = str(data_utm)
+            info["outputs"]["data_envi_hdr"] = str(data_hdr)
+
+            if export_loc:
+                info["outputs"]["loc_envi_bin"] = str(loc_utm)
+                info["outputs"]["loc_envi_hdr"] = str(loc_hdr)
+
+            if obs_file is not None:
+                info["outputs"]["obs_envi_bin"] = str(obs_utm)
+                info["outputs"]["obs_envi_hdr"] = str(obs_hdr)
+
+            return _finalize_and_return(data_utm)
+        
+        
+
+
+        def _run_gdalwarp(
+            src_path: str,
+            dst_path: str,
+            *,
+            xres: float = 60.0,
+            yres: float = 60.0,
+            src_srs: str | None = None,
+        ) -> dict:
+
             if s2_bounds is None:
                 raise ValueError("s2_bounds is None. Need s2_tif_path to align output grid.")
 
@@ -580,7 +867,11 @@ def nc_to_envi(
                 cmd.append("-overwrite")
             cmd += ["--config", "GDAL_CACHEMAX", "2048"]
 
+            if src_srs is not None:
+                cmd += ["-s_srs", src_srs]
+
             cmd += ["-t_srs", out_crs]
+
             cmd += ["-tr", str(xres), str(yres)]
             cmd += ["-te", str(left), str(aligned_bottom), str(aligned_right), str(top)]
             cmd += ["-srcnodata", str(NO_DATA_VALUE), "-dstnodata", str(NO_DATA_VALUE)]
@@ -605,8 +896,8 @@ def nc_to_envi(
         # ----------------------------------------------------------------
 
         # Precompute gather indices once (used by all exports)
-        gy = glt[..., 1][valid_glt]
-        gx = glt[..., 0][valid_glt]
+        gy = glt0[..., 1][valid_glt2]
+        gx = glt0[..., 0][valid_glt2]
 
         # ===== DATA export (only if needed) =====
         if need_data:
@@ -624,13 +915,56 @@ def nc_to_envi(
 
             data_gcs = str(temp_dir_p / f"data_gcs_{tag}")
             writer = ht.io.WriteENVI(data_gcs, data_header)
-            data_prj = np.full((glt.shape[0], glt.shape[1]), NO_DATA_VALUE, dtype=np.float32)
+            
 
-            for band_num in range(data.shape[2]):
-                band = data[:, :, band_num]
-                data_prj[valid_glt] = band[gy, gx]
-                writer.write_band(data_prj, band_num)
-                data_prj.fill(NO_DATA_VALUE)
+            B = data.shape[2]
+            chunk = 32  # tune 16/32/64 depending on RAM
+
+            for b0 in range(0, B, chunk):
+                b1 = min(b0 + chunk, B)
+
+                # raw block: (raw_y, raw_x, nb)
+                raw_blk = np.asarray(data[:, :, b0:b1], dtype=np.float32)
+                if transpose_raw_yx:
+                    raw_blk = np.transpose(raw_blk, (1, 0, 2))
+
+
+                # ortho block: (H, W, nb)
+                out_blk = np.full((H, W, b1 - b0), NO_DATA_VALUE, dtype=np.float32)
+                out_blk[valid_glt2, :] = raw_blk[gy, gx, :]
+
+
+                # write each band (because WriteENVI is band-oriented)
+                for i, band_num in enumerate(range(b0, b1)):
+                    writer.write_band(out_blk[:, :, i], band_num)
+
+            # ---- Diagnostic quicklook (single band) for alignment checks ----
+            # Pick a stable band index (e.g., middle band) so it always exists
+            diag_band = int(data.shape[2] // 2)  # 0-based
+            diag_src = f"{data_gcs}"
+
+            diag_dir = out_dir_p / "diag"
+            diag_dir.mkdir(parents=True, exist_ok=True)
+
+            diag_ortho_tif = diag_dir / f"{tag}_DATA_diag_band{diag_band:03d}_ortho_wgs84.tif"
+            diag_utm_tif   = diag_dir / f"{tag}_DATA_diag_band{diag_band:03d}_warp_utm.tif"
+
+            # Export only one band from the ortho ENVI to GeoTIFF (still uint16 reflectance scaling OK for DATA)
+            if save_geotiffs:
+                cmd = [
+                    "gdal_translate",
+                    "-b", str(diag_band + 1),  # GDAL is 1-based bands
+                    "-a_srs", "EPSG:4326",
+                    "-ot", "UInt16",
+                    "-co", "COMPRESS=DEFLATE", "-co", "PREDICTOR=2", "-co", "TILED=YES",
+                    "-scale", "0", "1", "0", "10000",  # reflectance scaling (keep your convention)
+                    diag_src, str(diag_ortho_tif),
+                ]
+                info["commands"]["gdal_translate_data_diag_ortho"] = run_cmd(cmd, check=True)
+                info["outputs"]["data_diag_ortho_tif"] = str(diag_ortho_tif)
+            # ---------------------------------------------------------------
+
+
 
             geotiff_dir = out_dir_p / "geotiff"
             geotiff_dir.mkdir(parents=True, exist_ok=True)
@@ -650,7 +984,8 @@ def nc_to_envi(
 
 
             print(f"Projecting data to {out_crs} {'(match S2 res)' if match_res else '(60 m)'} -> {data_utm}")
-            warp_rec = _run_gdalwarp(data_gcs, str(data_utm))
+            warp_rec = _run_gdalwarp(data_gcs, str(data_utm), xres=xres, yres=yres)
+
             info["commands"]["gdalwarp_data"] = warp_rec
             info["outputs"]["data_envi_bin"] = str(data_utm)
             info["outputs"]["data_envi_hdr"] = str(data_hdr)
@@ -663,6 +998,16 @@ def nc_to_envi(
 )
                 info["outputs"]["data_utm_tif"] = str(utm_tif)
                 info["rasters"]["data_utm_tif"] = raster_meta(str(utm_tif))
+                cmd = [
+                    "gdal_translate",
+                    "-b", str(diag_band + 1),
+                    "-ot", "UInt16",
+                    "-co", "COMPRESS=DEFLATE", "-co", "PREDICTOR=2", "-co", "TILED=YES",
+                    "-scale", "0", "1", "0", "10000",
+                    str(data_utm), str(diag_utm_tif),
+                ]
+                info["commands"]["gdal_translate_data_diag_utm"] = run_cmd(cmd, check=True)
+                info["outputs"]["data_diag_utm_tif"] = str(diag_utm_tif)
 
 
             # Fix header
@@ -675,7 +1020,9 @@ def nc_to_envi(
             data_header2["start acquisition time"] = start_time.strftime("%Y-%m-%dT%H:%M:%SZ")
             data_header2["end acquisition time"] = end_time.strftime("%Y-%m-%dT%H:%M:%SZ")
             data_header2["bounding box"] = [corner_1, corner_2, corner_3, corner_4]
-            data_header2["coordinate system string"] = []
+            if crs_wkt:
+                data_header2["coordinate system string"] = [crs_wkt]
+
             data_header2["sensor type"] = "EMIT"
             if "map info" in data_header2 and isinstance(data_header2["map info"], list):
                 if any(isinstance(v, str) and v.lower().startswith("units=") for v in data_header2["map info"]):
@@ -728,14 +1075,17 @@ def nc_to_envi(
             loc_vars = img_nc.groups["location"].variables
             loc_band = np.full((glt.shape[0], glt.shape[1]), NO_DATA_VALUE, dtype=np.float32)
             for band_num, name in enumerate(("lon", "lat", "elev")):
-                band = loc_vars[name][:]
-                loc_band[valid_glt] = band[gy, gx]
+                band = np.asarray(loc_vars[name][:], dtype=np.float32)
+                if transpose_raw_yx:
+                    band = band.T
+                loc_band[valid_glt2] = band[gy, gx]
                 writer.write_band(loc_band, band_num)
                 loc_band.fill(NO_DATA_VALUE)
 
             print(f"Projecting location datacube to {out_crs} {'(match S2 res)' if match_res else '(60 m)'} -> {loc_utm}")
             
-            warp_rec = _run_gdalwarp(loc_gcs, str(loc_utm))
+            warp_rec = _run_gdalwarp(loc_gcs, str(loc_utm), xres=xres, yres=yres)
+
             info["commands"]["gdalwarp_loc"] = warp_rec
             info["outputs"]["loc_envi_bin"] = str(loc_utm)
             info["outputs"]["loc_envi_hdr"] = str(loc_hdr)
@@ -743,10 +1093,12 @@ def nc_to_envi(
 
             if save_geotiffs:
                 loc_tif = (out_dir_p / "geotiff" / f"{tag}_LOC_warp_utm.tif")
-                info["commands"]["gdal_translate_loc_utm"] = export_uint16_deflate_geotiff(
+                info["commands"]["gdal_translate_loc_utm"] = export_loc_uint16_deflate_geotiff(
                     str(loc_utm), str(loc_tif),
-                    scale_mode="emit_reflectance_0_1"
+                    # optional: tune elev_range if you want tighter precision
+                    elev_range=(-1000.0, 12000.0),
                 )
+
                 info["outputs"]["loc_utm_tif"] = str(loc_tif)
                 info["rasters"]["loc_utm_tif"] = raster_meta(str(loc_tif))
 
@@ -754,7 +1106,6 @@ def nc_to_envi(
             loc_header2 = ht.io.envi.parse_envi_header(str(loc_hdr))
             loc_header2["band names"] = ["longitude", "latitude", "elevation"]
             loc_header2["description"] = "Location datacube"
-            loc_header2["coordinate system string"] = []
             loc_header2["start acquisition time"] = start_time.strftime("%Y-%m-%dT%H:%M:%SZ")
             loc_header2["end acquisition time"] = end_time.strftime("%Y-%m-%dT%H:%M:%SZ")
             loc_header2["bounding box"] = [corner_1, corner_2, corner_3, corner_4]
@@ -818,12 +1169,15 @@ def nc_to_envi(
                 obs_band = np.full((glt.shape[0], glt.shape[1]), NO_DATA_VALUE, dtype=np.float32)
                 for band_num in range(obs_cube.shape[2]):
                     band = obs_cube[..., band_num]
-                    obs_band[valid_glt] = band[gy, gx]
+                    if transpose_raw_yx:
+                        band = band.T
+                    obs_band[valid_glt2] = band[gy, gx]
                     writer.write_band(obs_band, band_num)
                     obs_band.fill(NO_DATA_VALUE)
 
                 print(f"Projecting observation datacube to {out_crs} {'(match S2 res)' if match_res else '(60 m)'} -> {obs_utm}")
-                warp_rec = _run_gdalwarp(obs_gcs, str(obs_utm))
+                warp_rec = _run_gdalwarp(obs_gcs, str(obs_utm), xres=xres, yres=yres)
+
                 info["commands"]["gdalwarp_obs"] = warp_rec
                 info["outputs"]["obs_envi_bin"] = str(obs_utm)
                 info["outputs"]["obs_envi_hdr"] = str(obs_hdr)
@@ -831,10 +1185,14 @@ def nc_to_envi(
 
                 if save_geotiffs:
                     obs_tif = (out_dir_p / "geotiff" / f"{tag}_OBS_warp_utm.tif")
-                    info["commands"]["gdal_translate_obs_utm"] = export_uint16_deflate_geotiff(
+                    info["commands"]["gdal_translate_obs_utm"] = export_obs_uint16_deflate_geotiff(
                         str(obs_utm), str(obs_tif),
-                        scale_mode="emit_reflectance_0_1"
+                        nodata_float=NO_DATA_VALUE,
+                        stride=64,     # speed/quality tradeoff
+                        p_low=1.0,
+                        p_high=99.0,
                     )
+
                     info["outputs"]["obs_utm_tif"] = str(obs_tif)
                     info["rasters"]["obs_utm_tif"] = raster_meta(str(obs_tif))
 
@@ -842,7 +1200,6 @@ def nc_to_envi(
                 obs_header2 = ht.io.envi.parse_envi_header(str(obs_hdr))
                 obs_header2["band names"] = obs_bandnames
                 obs_header2["description"] = "Observation datacube"
-                obs_header2["coordinate system string"] = []
                 obs_header2["start acquisition time"] = start_time.strftime("%Y-%m-%dT%H:%M:%SZ")
                 obs_header2["end acquisition time"] = end_time.strftime("%Y-%m-%dT%H:%M:%SZ")
                 obs_header2["bounding box"] = [corner_1, corner_2, corner_3, corner_4]
