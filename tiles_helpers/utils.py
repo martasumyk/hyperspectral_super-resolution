@@ -171,23 +171,20 @@ def save_tile_pair(
     *,
     tiled=True,
     overwrite=True,
-    # EMIT uint16 scaling
     emit_scale=10000.0,          
     emit_nodata_u16=65535,
-    # compression
     compress="DEFLATE",
     zlevel=1,
     num_threads="ALL_CPUS",
 ):
 
     def _auto_block_size(width: int, height: int) -> int:
-        # Simple rule: smaller tiles -> 64; medium/large -> 256.
         m = min(width, height)
         if m >= 256:
             return 256
         if m >= 64:
             return 64
-        return 16  # fallback (won't happen for your 100/600 tiles)
+        return 16 
 
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -215,11 +212,9 @@ def save_tile_pair(
         emit_transform = window_transform(w_emit, emit_ds.transform)
         s2_transform   = window_transform(w_s2,   s2_ds.transform)
 
-        # Preserve EMIT tags
         emit_ds_tags   = emit_ds.tags()
         emit_band_tags = [emit_ds.tags(i) for i in range(1, emit_ds.count + 1)]
 
-        # --- EMIT: float -> uint16 (scaled) ---
         emit = emit_tile.astype(np.float32, copy=False)
 
         valid = np.isfinite(emit)
