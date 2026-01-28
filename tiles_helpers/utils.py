@@ -231,7 +231,6 @@ def save_tile_pair(
         eh, ew = emit_u16.shape[1], emit_u16.shape[2]
         sh, sw = s2_tile.shape[1], s2_tile.shape[2]
 
-        # Auto block sizes (simple + sane)
         e_blk = _auto_block_size(ew, eh)
         s_blk = _auto_block_size(sw, sh)
 
@@ -244,7 +243,7 @@ def save_tile_pair(
             transform=emit_transform,
             nodata=int(emit_nodata_u16),
             compress=compress,
-            predictor=2,                  # good for integers
+            predictor=2,                 
             ZLEVEL=int(zlevel),
             BIGTIFF="IF_SAFER",
             NUM_THREADS=str(num_threads),
