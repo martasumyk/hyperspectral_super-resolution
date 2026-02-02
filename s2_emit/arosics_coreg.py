@@ -3,7 +3,7 @@ import re
 import json
 import numpy as np
 import rasterio
-from arosics import COREG
+from arosics import COREG_LOCAL
 
 def s2_bandmap_from_template(s2_template_tif: str) -> dict[str, int]:
     with rasterio.open(s2_template_tif) as src:
@@ -91,19 +91,24 @@ def _norm_code(x: str) -> str:
 
 def coregister_s2_granule_to_emit_granule(
     *,
-    emit_ref_tif: str,       # warped EMIT GeoTIFF 
-    s2_tgt_tif: str,         # S2 overlap GeoTIFF 
-    emit_nc_path: str,       # original EMIT netCDF path
-    s2_template_tif: str,    # s2_overlap
-    out_s2_tif: str,        
-    prefer=("B08", "B04"),   # trying these S2 bands 
-    ws=(512, 512),           # large window for granule-level matching
-    max_shift=50,            # in reference pixels (EMIT px)
+    emit_ref_tif: str,
+    s2_tgt_tif: str,
+    emit_nc_path: str,
+    s2_template_tif: str,
+    out_s2_tif: str,
+    prefer=("B08", "B04"),
+    window_size=(512, 512),   
+    grid_res=600,             
+    max_points=500,           
+    max_shift=50,
+    min_reliability=60,  
+    tieP_filter_level=3,
     nodata_emit=65535,
-    nodata_s2=None,          # if None, use whatever is in file metadata
-    out_gsd=[10, 10],       
+    nodata_s2=None,
+    out_gsd=[10, 10],
     resamp_calc="cubic",
     resamp_deshift="cubic",
+    cliptoextent=True
 ):
     s2_map = s2_bandmap_from_template(str(s2_template_tif))
     emit_wl_nm = load_emit_wavelengths_nm_from_nc(str(emit_nc_path))
@@ -127,9 +132,13 @@ def coregister_s2_granule_to_emit_granule(
             continue
 
         try:
-            CR = COREG(
+            CRL = COREG_LOCAL(
                 im_ref=str(emit_ref_tif),
                 im_tgt=str(s2_tgt_tif),
+                grid_res=float(grid_res),
+                max_points=int(max_points) if max_points is not None else None,
+                window_size=tuple(window_size),
+
                 path_out=str(out_s2_tif),
                 fmt_out="GTIFF",
                 out_crea_options=["TILED=YES", "COMPRESS=DEFLATE"],
@@ -137,37 +146,36 @@ def coregister_s2_granule_to_emit_granule(
                 r_b4match=int(emit_match[code]),
                 s_b4match=int(s2_map[code]),
 
-                ws=ws,
-                max_shift=max_shift,
-                nodata=(nodata_emit, nodata_s2),
+                max_shift=int(max_shift),
+                min_reliability=int(min_reliability),
+                tieP_filter_level=int(tieP_filter_level),
 
+                nodata=(nodata_emit, nodata_s2),
                 resamp_alg_calc=resamp_calc,
                 resamp_alg_deshift=resamp_deshift,
 
-                match_gsd=False,     # keep S2 at its resolution
-                align_grids=True,    # align to EMIT grid
+                match_gsd=False,
+                align_grids=True,
                 out_gsd=list(out_gsd),
+
+                cliptoextent=bool(cliptoextent),
             )
 
-            CR.calculate_spatial_shifts()
-            ok = bool(getattr(CR, "success", False))
-
+            result = CRL.correct_shifts() 
+            ok = bool(getattr(CRL, "success", True)) 
             info = {
                 "success": ok,
                 "s2_code": code,
                 "s2_match_band_1b": int(s2_map[code]),
                 "emit_match_band_1b": int(emit_match[code]),
                 "emit_match_wl_nm": float(emit_wl_nm[int(emit_match[code]) - 1]),
-                "x_shift_map": getattr(CR, "x_shift_map", None),
-                "y_shift_map": getattr(CR, "y_shift_map", None),
-                "x_shift_px": getattr(CR, "x_shift_px", None),
-                "y_shift_px": getattr(CR, "y_shift_px", None),
-                "shift_reliability": getattr(CR, "shift_reliability", None),
+                "grid_res": grid_res,
+                "max_points": max_points,
+                "result_keys": list(result.keys()) if isinstance(result, dict) else None,
             }
             attempts.append(info)
 
             if ok:
-                CR.correct_shifts()
                 return {"final": info, "attempts": attempts, "out_s2_tif": str(out_s2_tif)}
 
         except Exception as e:
@@ -175,4 +183,3 @@ def coregister_s2_granule_to_emit_granule(
             attempts.append({"s2_code": code, "success": False, "error": last_err})
 
     return {"final": {"success": False, "error": last_err or "All attempts failed"}, "attempts": attempts, "out_s2_tif": str(out_s2_tif)}
-
