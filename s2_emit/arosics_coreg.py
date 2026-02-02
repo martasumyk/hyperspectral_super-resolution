@@ -158,10 +158,9 @@ def coregister_s2_granule_to_emit_granule(
                 align_grids=True,
                 out_gsd=list(out_gsd),
 
-                cliptoextent=bool(cliptoextent),
             )
 
-            result = CRL.correct_shifts() 
+            result = CRL.correct_shifts(cliptoextent=cliptoextent) 
             ok = bool(getattr(CRL, "success", True)) 
             info = {
                 "success": ok,
