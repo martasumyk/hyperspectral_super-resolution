@@ -32,7 +32,6 @@ CLOUD_CLASSES = {8, 9, 10, 11}
 
 def count_cloud_pixels(scl_href: str, roi_geom_wgs84):
     """Return (#cloud_pixels, #total_valid_pixels) within ROI from an SCL raster (URL or local)."""
-    # Force GDAL's HTTP random-access VFS for remote URLs.
     vsi_href = scl_href
     if scl_href.startswith("http://") or scl_href.startswith("https://"):
         vsi_href = f"/vsicurl/{scl_href}"
@@ -50,8 +49,9 @@ def count_cloud_pixels(scl_href: str, roi_geom_wgs84):
             scl = data[0]
             valid = scl != 0
             total = int(valid.sum())
-            clouds = int(np.isin(scl, list(CLOUD_CLASSES)).sum())
+            clouds = int(np.isin(scl[valid], list(CLOUD_CLASSES)).sum())  # <-- only valid pixels
             return clouds, total
+
 
 
 def best_asset_key(assets, base):

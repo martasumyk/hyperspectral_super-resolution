@@ -1,6 +1,6 @@
 import pyproj
 from shapely.geometry import Point, box, Polygon
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 import requests
 from tqdm import tqdm
 import matplotlib.pyplot as plt
@@ -18,52 +18,208 @@ from s2_data.cloud_utils import (
     best_asset_key, reproject_geom, scl_metrics, count_cloud_pixels
 )
 
+from documentation.pairs_artifacts import emit_polygon_bounds_wgs84
+
 
 from rasterio.windows import from_bounds
 from rasterio.windows import Window
 from rasterio.windows import transform as win_transform
 import math
+from shapely.geometry import shape
+from shapely.ops import transform, unary_union
+
+from dateutil.parser import isoparse
+
+def emit_geom_wgs84_from_umm(umm: dict):
+    """Parse UMM GPolygons into a Shapely geometry (Polygon/MultiPolygon) in EPSG:4326."""
+    gpolys = (
+        (umm.get("SpatialExtent") or {})
+        .get("HorizontalSpatialDomain", {})
+        .get("Geometry", {})
+        .get("GPolygons", [])
+    )
+    if not gpolys:
+        return None
+
+    polys = []
+    for gp in gpolys:
+        pts = (gp.get("Boundary") or {}).get("Points", [])
+        coords = [(p.get("Longitude"), p.get("Latitude")) for p in pts]
+        coords = [(x, y) for x, y in coords if x is not None and y is not None]
+        if len(coords) < 3:
+            continue
+        if coords[0] != coords[-1]:
+            coords.append(coords[0])
+        poly = Polygon(coords)
+        if not poly.is_valid:
+            poly = poly.buffer(0)
+        if not poly.is_empty:
+            polys.append(poly)
+
+    if not polys:
+        return None
+
+    geom = unary_union(polys)
+    if geom.geom_type in ("Polygon", "MultiPolygon"):
+        return geom
+    geoms = [g for g in getattr(geom, "geoms", []) if g.geom_type in ("Polygon", "MultiPolygon")]
+    return unary_union(geoms) if geoms else None
+
+def _to_utc(dt):
+    if dt.tzinfo is None:
+        return dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc)
+
+def local_solar_time_hours(dt_utc, lon_deg):
+    dt_utc = _to_utc(dt_utc)
+    h = dt_utc.hour + dt_utc.minute/60 + dt_utc.second/3600
+    return (h + lon_deg/15.0) % 24.0
+
+def circ_hours_diff(a, b):
+    d = abs(a - b) % 24.0
+    return min(d, 24.0 - d)
+
+_CRS_AREA = pyproj.CRS.from_epsg(6933)
+_to_area = pyproj.Transformer.from_crs("EPSG:4326", _CRS_AREA, always_xy=True).transform
+
+def area_m2(geom):
+    return transform(_to_area, geom).area
+
+def overlap_emit_fraction(emit_geom, s2_geom):
+    """Return (frac_of_emit_covered, overlap_geom)."""
+    inter = emit_geom.intersection(s2_geom)
+    if inter.is_empty:
+        return 0.0, inter
+    a_inter = area_m2(inter)
+    a_emit = max(area_m2(emit_geom), 1e-9)
+    return a_inter / a_emit, inter
 
 
+def find_best_s2_for_emit_item(
+    emit_item: dict,
+    *,
+    s2_collection,
+    s2_api,
+    days=3.0,                 # allow +/- N days
+    max_tod_diff_h=1.5,       # "same time-of-day" tolerance (hours)
+    min_emit_overlap=0.6,     # require S2 covers >= this fraction of EMIT polygon
+    top_k_prefilter=20,       # only run SCL on best few
+):
+    """
+    Independent: uses only emit_item['umm'] to get time + geometry.
+    Returns (best_s2_item, best_cloud_frac, debug_dict)
+    """
+    umm = emit_item.get("umm") or {}
 
-def find_best_s2_for_date(date_iso: str, lon: float, lat: float,
-                          s2_collection, search_buffer, s2_api):
-    """For the SAME date, search S2 in ROI; return least-cloudy item + cloud fraction using SCL."""
-    bbox_poly = point_buffer_bbox(lon, lat, search_buffer)
-    roi_geom = box(*bbox_poly.bounds)
+    begin = (umm.get("TemporalExtent") or {}).get("RangeDateTime", {}).get("BeginningDateTime")
+    if not begin:
+        return None, None, {"reason": "emit_missing_begin_time"}
 
-    time_range = f"{date_iso}T00:00:00Z/{date_iso}T23:59:59Z"
+    emit_dt = _to_utc(isoparse(begin))
+
+    emit_geom = emit_geom_wgs84_from_umm(umm)
+    if emit_geom is None:
+        # fallback: bbox only (less correct for overlap, but keeps pipeline running)
+        bounds, centroid = emit_polygon_bounds_wgs84(umm)
+        if not bounds:
+            return None, None, {"reason": "emit_missing_polygon"}
+        emit_geom = box(*bounds)
+        anchor_lon = centroid["lon"]
+    else:
+        anchor_lon = float(emit_geom.centroid.x)
+
+    emit_lst = local_solar_time_hours(emit_dt, anchor_lon)
+
+    dt0 = emit_dt - timedelta(days=days)
+    dt1 = emit_dt + timedelta(days=days)
+    time_range = f"{dt0.isoformat().replace('+00:00','Z')}/{dt1.isoformat().replace('+00:00','Z')}"
+
     client = Client.open(s2_api)
-    search = client.search(collections=[s2_collection], datetime=time_range, bbox=bbox_poly.bounds)
+
+    search = client.search(
+        collections=[s2_collection],
+        datetime=time_range,
+        bbox=emit_geom.bounds,
+    )
     items = list(search.get_items())
     if not items:
-        return None, None
+        return None, None, {"reason": "no_s2_items", "time_range": time_range}
 
-    best_item = None
-    best_frac = None
-
-    for item in tqdm(items, desc=f"S2 cloud check {date_iso}"):
-        key = best_asset_key(item.assets, "scl")
-        if key is None:
+    cand = []
+    for it in items:
+        if it.datetime is None or it.geometry is None:
             continue
 
-        url = item.assets[key].href
+        s2_dt = _to_utc(it.datetime)
+        s2_lst = local_solar_time_hours(s2_dt, anchor_lon)
+        tod_d = circ_hours_diff(emit_lst, s2_lst)
+        if tod_d > max_tod_diff_h:
+            continue
 
-        # Strongly prefer GeoTIFF/Cog (usually 'scl'); JP2 often can't do efficient range reads.
+        s2_geom = shape(it.geometry)
+        frac_emit, overlap_geom = overlap_emit_fraction(emit_geom, s2_geom)
+        if overlap_geom.is_empty or frac_emit < min_emit_overlap:
+            continue
+
+        meta_cc = float(it.properties.get("eo:cloud_cover", 999.0))
+        cand.append((tod_d, frac_emit, meta_cc, it, overlap_geom))
+
+    if not cand:
+        return None, None, {
+            "reason": "no_candidates_after_tod_and_overlap",
+            "time_range": time_range,
+            "n_items": len(items),
+        }
+
+    cand.sort(key=lambda x: (x[0], -x[1], x[2]))
+    cand = cand[:max(1, min(top_k_prefilter, len(cand)))]
+
+    best = None
+    for tod_d, frac_emit, meta_cc, it, overlap_geom in tqdm(cand, desc="S2 SCL over overlap"):
+        key = best_asset_key(it.assets, "scl")
+        if key is None:
+            continue
         if key.lower() == "scl-jp2":
-            continue  # or fallback to metadata-based cloud if you want
+            continue
 
+        href = it.assets[key].href
         try:
-            clouds, total = count_cloud_pixels(url, roi_geom)   # <-- URL, not local file
+            clouds, total = count_cloud_pixels(href, overlap_geom)
         except (rasterio.errors.RasterioIOError, ValueError):
             continue
 
-        frac = (clouds / total) if total else 1.0
-        if best_frac is None or frac < best_frac:
-            best_frac = frac
-            best_item = item
+        cloud_frac = (clouds / total) if total else 1.0
 
-    return best_item, best_frac
+        # Final ranking: TOD, overlap, then actual SCL cloud
+        rank = (tod_d, -frac_emit, cloud_frac)
+        if best is None or rank < best["rank"]:
+            best = {
+                "item": it,
+                "cloud_frac": cloud_frac,
+                "rank": rank,
+                "tod_d": tod_d,
+                "frac_emit": frac_emit,
+                "meta_cc": meta_cc,
+            }
+
+    if best is None:
+        return None, None, {"reason": "all_scl_failed", "n_prefilter": len(cand)}
+
+    dbg = {
+        "emit_begin": begin,
+        "time_range": time_range,
+        "emit_lst": emit_lst,
+        "picked": {
+            "tod_diff_h": best["tod_d"],
+            "emit_overlap_frac": best["frac_emit"],
+            "meta_cloud_pct": best["meta_cc"],
+            "scl_cloud_frac": best["cloud_frac"],
+        },
+        "n_items": len(items),
+        "n_prefilter": len(cand),
+    }
+    return best["item"], best["cloud_frac"], dbg
+
 
 
 def point_buffer_bbox(lon: float, lat: float, meters: float):
