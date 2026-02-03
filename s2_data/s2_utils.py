@@ -22,6 +22,7 @@ from s2_data.cloud_utils import (
 from rasterio.windows import from_bounds
 from rasterio.windows import Window
 from rasterio.windows import transform as win_transform
+import math
 
 
 
@@ -452,37 +453,87 @@ def download_s2_spectral_stack(item, s2_dir: Path) -> Path:
 
     return out_stack
 
+
 def crop_s2_stack_to_te(
     s2_stack_path,
     out_path,
     left, bottom, right, top,
     overwrite=False,
-    return_info=False,   # NEW
+    return_info=False,
+    *,
+    snap_te_to_src_grid=True,
+    cover_bounds=True,       
+    chunk_size=1024,     
 ):
     s2_stack_path = Path(s2_stack_path)
     out_path = Path(out_path)
     out_path.parent.mkdir(parents=True, exist_ok=True)
 
     if out_path.exists() and not overwrite:
-        print("Cropped output already exists")
+        msg = "Cropped output already exists"
+        print(msg)
         if return_info:
-            return out_path, {"note": "already existed", "out_path": str(out_path)}
+            return out_path, {"note": msg, "out_path": str(out_path)}
         return out_path
 
+    left = float(left)
+    bottom = float(bottom)
+    right = float(right)
+    top = float(top)
+
     with rasterio.open(s2_stack_path) as src:
+        if src.transform is None:
+            raise ValueError("Source raster has no transform; cannot crop by TE.")
+
+        snapped_te = None
+        if snap_te_to_src_grid:
+            x0 = float(src.transform.c)          # UL x
+            y0 = float(src.transform.f)          # UL y
+            dx = abs(float(src.transform.a))     # pixel width
+            dy = abs(float(src.transform.e))     # pixel height (e is negative usually)
+
+            def snap_x(x: float) -> float:
+                k = math.floor(((x - x0) / dx) + 0.5)
+                return x0 + k * dx
+
+            def snap_y(y: float) -> float:
+                k = math.floor(((y0 - y) / dy) + 0.5)
+                return y0 - k * dy
+
+            left_s   = snap_x(left)
+            right_s  = snap_x(right)
+            top_s    = snap_y(top)
+            bottom_s = snap_y(bottom)
+
+            if right_s <= left_s or top_s <= bottom_s:
+                raise ValueError(f"Invalid TE after snapping to grid: {(left_s, bottom_s, right_s, top_s)}")
+
+            snapped_te = {"left": left_s, "bottom": bottom_s, "right": right_s, "top": top_s}
+            left, bottom, right, top = left_s, bottom_s, right_s, top_s
+        # ---------------------------------------------------------------------------
+
         w = from_bounds(left, bottom, right, top, transform=src.transform)
-        w_int = Window(
-            col_off=int(round(w.col_off)),
-            row_off=int(round(w.row_off)),
-            width=int(round(w.width)),
-            height=int(round(w.height)),
-        )
+
+        if cover_bounds:
+            eps = 1e-9
+            col0 = int(math.floor(w.col_off + eps))
+            row0 = int(math.floor(w.row_off + eps))
+            col1 = int(math.ceil(w.col_off + w.width  - eps))
+            row1 = int(math.ceil(w.row_off + w.height - eps))
+            w_int = Window(col_off=col0, row_off=row0, width=col1 - col0, height=row1 - row0)
+        else:
+            w_int = Window(
+                col_off=int(round(w.col_off)),
+                row_off=int(round(w.row_off)),
+                width=int(round(w.width)),
+                height=int(round(w.height)),
+            )
 
         full = Window(0, 0, src.width, src.height)
         w_int = w_int.intersection(full)
 
         if w_int.width <= 0 or w_int.height <= 0:
-            raise ValueError("Overlap window is empty after clipping. Check -te / CRS inputs.")
+            raise ValueError("Overlap window is empty after clipping. Check TE / CRS / alignment inputs.")
 
         out_transform = win_transform(w_int, src.transform)
 
@@ -496,41 +547,63 @@ def crop_s2_stack_to_te(
             compress="DEFLATE",
             predictor=2,
             zlevel=1,
+            BIGTIFF="IF_SAFER",
         )
 
         bx = min(512, profile["width"])
         by = min(512, profile["height"])
-        profile.update(blockxsize=bx, blockysize=by)
+        profile.update(blockxsize=int(bx), blockysize=int(by))
 
-        src_desc = list(src.descriptions)
-        src_tags = src.tags()
+        src_desc = list(src.descriptions) if src.descriptions is not None else []
+        src_tags = src.tags() or {}
         src_band_tags = [src.tags(i) for i in range(1, src.count + 1)]
 
-        data = src.read(window=w_int)
+        out_w = int(w_int.width)
+        out_h = int(w_int.height)
+        bands = src.count
 
         with rasterio.open(out_path, "w", **profile) as dst:
-            dst.write(data)
-
             if src_tags:
                 dst.update_tags(**src_tags)
 
-            for i in range(1, src.count + 1):
+            for i in range(1, bands + 1):
                 bt = src_band_tags[i - 1]
                 if bt:
                     dst.update_tags(i, **bt)
-
-                d = src_desc[i - 1] if i - 1 < len(src_desc) else None
+                d = src_desc[i - 1] if (i - 1) < len(src_desc) else None
                 if d:
                     dst.set_band_description(i, d)
 
+            step = int(chunk_size)
+            for r0 in range(0, out_h, step):
+                h = min(step, out_h - r0)
+                for c0 in range(0, out_w, step):
+                    w0 = min(step, out_w - c0)
+
+                    out_win = Window(c0, r0, w0, h)
+                    src_win = Window(
+                        w_int.col_off + out_win.col_off,
+                        w_int.row_off + out_win.row_off,
+                        out_win.width,
+                        out_win.height,
+                    )
+
+                    data = src.read(window=src_win)  # (bands, h, w)
+                    dst.write(data, window=out_win)
+
     print("Wrote:", out_path)
 
-    # Build small provenance dict (NEW)
     crop_info = {
         "src_path": str(s2_stack_path),
         "out_path": str(out_path),
         "te": {"left": float(left), "bottom": float(bottom), "right": float(right), "top": float(top)},
-        "window": {"col_off": int(w_int.col_off), "row_off": int(w_int.row_off), "width": int(w_int.width), "height": int(w_int.height)},
+        "snapped_te": snapped_te,
+        "window": {
+            "col_off": int(w_int.col_off),
+            "row_off": int(w_int.row_off),
+            "width": int(w_int.width),
+            "height": int(w_int.height),
+        },
         "profile": {
             "crs": str(profile.get("crs")),
             "dtype": str(profile.get("dtype")),
@@ -542,51 +615,9 @@ def crop_s2_stack_to_te(
             "blockxsize": int(profile.get("blockxsize", 0)),
             "blockysize": int(profile.get("blockysize", 0)),
         },
-        "band_descriptions": list(src_desc),
+        "band_descriptions": src_desc,
     }
 
     if return_info:
         return out_path, crop_info
     return out_path
-
-
-def plot_s2_truecolor_from_stack(stack_path, ax=None):
-    with rasterio.open(stack_path) as ds:
-        desc = list(ds.descriptions)
-
-        def find_band(keywords):
-            for i, d in enumerate(desc, start=1):
-                if d is None:
-                    continue
-                d_low = d.lower()
-                if all(k in d_low for k in keywords):
-                    return i
-            return None
-
-        b_red   = find_band(["b04"]) or find_band(["red"])
-        b_green = find_band(["b03"]) or find_band(["green"])
-        b_blue  = find_band(["b02"]) or find_band(["blue"])
-
-        if not (b_red and b_green and b_blue):
-            raise ValueError(f"Can't find RGB bands in descriptions: {desc}")
-
-        arr = ds.read([b_red, b_green, b_blue]).astype("float32")
-
-    rgb = np.moveaxis(arr, 0, -1)
-
-    # reflectance scaling heuristic (keep yours)
-    if np.nanmax(rgb) > 1.5:
-        rgb = rgb / 10000.0
-
-    valid = np.isfinite(rgb)
-    p2, p98 = np.nanpercentile(rgb[valid], [2, 98])
-    rgb = np.clip((rgb - p2) / (p98 - p2 + 1e-6), 0, 1)
-
-    if ax is None:
-        _, ax = plt.subplots(figsize=(7, 7))
-
-    ax.imshow(rgb)
-    ax.set_title("Sentinel-2 true color (B04, B03, B02)")
-    ax.axis("off")
-    return rgb
-

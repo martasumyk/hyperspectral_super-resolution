@@ -351,17 +351,36 @@ def _snap_te_to_s2_grid(te, s2_bounds, xres=60.0, yres=60.0):
 
     return (l2, b2, r2, t2)
 
-def _compute_te(src_path, s2_bounds, out_crs, xres=60.0, yres=60.0):
-    src_te = _bounds_to_out_crs(src_path, out_crs)
-    s2_te  = (float(s2_bounds.left), float(s2_bounds.bottom),
-              float(s2_bounds.right), float(s2_bounds.top))
+def _compute_te(src_path, s2_te_exact, s2_origin_xy, out_crs, xres=60.0, yres=60.0):
+    # src bounds in out_crs (UTM)
+    src_te = _bounds_to_out_crs(src_path, out_crs)  # (left,bottom,right,top) in out_crs
+
+    # exact S2 extent in out_crs (already in out_crs because S2 is in out_crs)
+    s2_te = tuple(map(float, s2_te_exact))  # (left,bottom,right,top)
 
     inter = _intersect(src_te, s2_te)
     if inter is None:
-        raise ValueError("No overlap between EMIT source bounds and S2 bounds in out_crs.")
+        raise ValueError("No overlap between EMIT source bounds and S2 extent in out_crs.")
 
-    inter_snapped = _snap_te_to_s2_grid(inter, s2_bounds, xres=xres, yres=yres)
-    return inter_snapped
+    inter_left, inter_bottom, inter_right, inter_top = map(float, inter)
+
+    x0, y0 = map(float, s2_origin_xy)
+    step_x, step_y = float(xres), float(yres)
+
+    eps = 1e-9
+
+    left  = x0 + math.ceil(((inter_left  - x0) / step_x) - eps) * step_x
+    right = x0 + math.floor(((inter_right - x0) / step_x) + eps) * step_x
+
+    top    = y0 - math.ceil(((y0 - inter_top) / step_y) - eps) * step_y
+    bottom = y0 - math.floor(((y0 - inter_bottom) / step_y) + eps) * step_y
+
+
+    if right <= left or top <= bottom:
+        raise ValueError(f"Snapped TE is invalid: {(left,bottom,right,top)}")
+
+    return (left, bottom, right, top)
+
 
 
 import math
@@ -766,15 +785,35 @@ def nc_to_envi(
                 out_epsg_int = s2_crs.to_epsg()
                 crs_wkt = s2_crs.to_wkt()
 
-                s2_bounds = src.bounds  # left, bottom, right, top
-                s2_res = (abs(float(src.res[0])), abs(float(src.res[1])))
+                s2_bounds = src.bounds
 
-                if match_res and src.res is not None:
-                    out_ps = s2_res
+                s2_transform = src.transform
+                s2_width = int(src.width)
+                s2_height = int(src.height)
+
+                s2_dx = abs(float(s2_transform.a))
+                s2_dy = abs(float(s2_transform.e))
+
+                s2_x0 = float(s2_transform.c) 
+                s2_y0 = float(s2_transform.f) 
+
+                s2_left   = s2_x0
+                s2_top    = s2_y0
+                s2_right  = s2_left + s2_width * s2_dx
+                s2_bottom = s2_top  - s2_height * s2_dy
+
+                emit_step = 60.0
+                s2_te_exact = (s2_left, s2_bottom, s2_right, s2_top)
+
+                if abs((emit_step / s2_dx) - round(emit_step / s2_dx)) > 1e-9:
+                    raise ValueError(f"emit_step={emit_step} must be integer multiple of S2 dx={s2_dx}")
+                if abs((emit_step / s2_dy) - round(emit_step / s2_dy)) > 1e-9:
+                    raise ValueError(f"emit_step={emit_step} must be integer multiple of S2 dy={s2_dy}")
+
         if not out_crs:
             raise ValueError("out_crs is None. Provide s2_tif_path or enable epsg/UTM fallback.")
 
-        xres, yres = (float(out_ps[0]), float(out_ps[1])) if match_res else (60.0, 60.0)
+        xres, yres = (60.0, 60.0)
 
         ts = start_time.strftime("%Y%m%dT%H%M%S")
         suffix = f"_{tag}" if tag else ""
@@ -820,6 +859,15 @@ def nc_to_envi(
             "rasters": {},
         }
 
+        info["s2_align"].update({
+            "s2_transform": [float(s2_transform.a), float(s2_transform.b), float(s2_transform.c),
+                            float(s2_transform.d), float(s2_transform.e), float(s2_transform.f)],
+            "s2_grid_extent": [float(s2_left), float(s2_bottom), float(s2_right), float(s2_top)],
+            "s2_origin": [float(s2_x0), float(s2_y0)],
+            "emit_target_ps": [60.0, 60.0],
+            "emit_anchor_mode": "s2_origin",
+        })
+
         if not (need_data or need_loc or need_obs):
             print(f"All requested outputs already exist; skipping. Returning: {data_utm}")
 
@@ -852,15 +900,27 @@ def nc_to_envi(
             if s2_bounds is None:
                 raise ValueError("s2_bounds is None. Need s2_tif_path to align output grid.")
 
+            xres = float(xres)
+            yres = float(yres)
 
-            left, bottom, right, top = _compute_te(src_path, s2_bounds, out_crs, xres=xres, yres=yres)
+            x0 = s2_x0
+            y0 = s2_y0
+            step_x = xres
+            step_y = yres
 
+            left, bottom, right, top = _compute_te(
+                src_path,
+                s2_te_exact=s2_te_exact,
+                s2_origin_xy=(s2_x0, s2_y0),
+                out_crs=out_crs,
+                xres=xres,
+                yres=yres,
+            )
+            cols = int(round((right - left) / step_x))
+            rows = int(round((top - bottom) / step_y))
 
-            cols = math.ceil((right - left) / xres)
-            rows = math.ceil((top - bottom) / yres)
-
-            aligned_right = left + cols * xres
-            aligned_bottom = top - rows * yres
+            if cols <= 0 or rows <= 0:
+                raise ValueError(f"Bad target shape cols={cols}, rows={rows} from snapped extent.")
 
             cmd = ["gdalwarp"]
             if overwrite:
@@ -872,8 +932,8 @@ def nc_to_envi(
 
             cmd += ["-t_srs", out_crs]
 
-            cmd += ["-tr", str(xres), str(yres)]
-            cmd += ["-te", str(left), str(aligned_bottom), str(aligned_right), str(top)]
+            cmd += ["-te", str(left), str(bottom), str(right), str(top)]
+            cmd += ["-ts", str(cols), str(rows)]
             cmd += ["-srcnodata", str(NO_DATA_VALUE), "-dstnodata", str(NO_DATA_VALUE)]
             cmd += ["-multi", "-wo", "NUM_THREADS=ALL_CPUS", "-wm", "2048"]
             cmd += ["-r", "cubic", "-of", "ENVI", src_path, dst_path]
@@ -881,14 +941,17 @@ def nc_to_envi(
             rec = run_cmd(cmd, check=True)
             rec["aligned_extent"] = {
                 "left": left,
-                "bottom": aligned_bottom,
-                "right": aligned_right,
+                "bottom": bottom,
+                "right": right,
                 "top": top,
-                "cols": int(cols),
-                "rows": int(rows),
-                "xres": xres,
-                "yres": yres,
+                "cols": cols,
+                "rows": rows,
+                "xres": step_x,
+                "yres": step_y,
+                "anchor_x0": x0,
+                "anchor_y0": y0,
             }
+
             return rec
 
 

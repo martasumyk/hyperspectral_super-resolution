@@ -122,7 +122,7 @@ def coregister_s2_granule_to_emit_granule(
 
     attempts = []
     last_err = None
-
+ 
     for code_raw in prefer:
         code = _norm_code(code_raw)
         if code not in target_nm:
@@ -131,109 +131,54 @@ def coregister_s2_granule_to_emit_granule(
             attempts.append({"s2_code": code, "success": False, "error": f"{code} not in S2 template descriptions"})
             continue
 
+        try:
+            CRL = COREG_LOCAL(
+                im_ref=str(emit_ref_tif),
+                im_tgt=str(s2_tgt_tif),
+                grid_res=float(grid_res),
+                max_points=int(max_points) if max_points is not None else None,
+                window_size=tuple(window_size),
 
-        CRL = COREG_LOCAL(
-            im_ref=str(emit_ref_tif),
-            im_tgt=str(s2_tgt_tif),
-            grid_res=float(grid_res),
-            max_points=int(max_points) if max_points is not None else None,
-            window_size=tuple(window_size),
+                path_out=str(out_s2_tif),
+                fmt_out="GTIFF",
+                out_crea_options=["TILED=YES", "COMPRESS=DEFLATE"],
 
-            path_out=str(out_s2_tif),
-            fmt_out="GTIFF",
-            out_crea_options=["TILED=YES", "COMPRESS=DEFLATE"],
+                r_b4match=int(emit_match[code]),
+                s_b4match=int(s2_map[code]),
 
-            r_b4match=int(emit_match[code]),
-            s_b4match=int(s2_map[code]),
+                max_shift=int(max_shift),
+                min_reliability=int(min_reliability),
+                tieP_filter_level=int(tieP_filter_level),
 
-            max_shift=int(max_shift),
-            min_reliability=int(min_reliability),
-            tieP_filter_level=int(tieP_filter_level),
+                nodata=(nodata_emit, nodata_s2),
+                resamp_alg_calc=resamp_calc,
+                resamp_alg_deshift=resamp_deshift,
 
-            nodata=(nodata_emit, nodata_s2),
-            resamp_alg_calc=resamp_calc,
-            resamp_alg_deshift=resamp_deshift,
+                match_gsd=False,
+                align_grids=True,
+                out_gsd=list(out_gsd),
 
-            match_gsd=False,
-            align_grids=True,
-            out_gsd=list(out_gsd),
+            )
 
-        )
+            result = CRL.correct_shifts(cliptoextent=cliptoextent) 
+            ok = bool(getattr(CRL, "success", True)) 
+            info = {
+                "success": ok,
+                "s2_code": code,
+                "s2_match_band_1b": int(s2_map[code]),
+                "emit_match_band_1b": int(emit_match[code]),
+                "emit_match_wl_nm": float(emit_wl_nm[int(emit_match[code]) - 1]),
+                "grid_res": grid_res,
+                "max_points": max_points,
+                "result_keys": list(result.keys()) if isinstance(result, dict) else None,
+            }
+            attempts.append(info)
 
-        result = CRL.correct_shifts(cliptoextent=cliptoextent) 
-        ok = bool(getattr(CRL, "success", True)) 
-        info = {
-            "success": ok,
-            "s2_code": code,
-            "s2_match_band_1b": int(s2_map[code]),
-            "emit_match_band_1b": int(emit_match[code]),
-            "emit_match_wl_nm": float(emit_wl_nm[int(emit_match[code]) - 1]),
-            "grid_res": grid_res,
-            "max_points": max_points,
-            "result_keys": list(result.keys()) if isinstance(result, dict) else None,
-        }
-        attempts.append(info)
+            if ok:
+                return {"final": info, "attempts": attempts, "out_s2_tif": str(out_s2_tif)}
+            
+        except Exception as e:
+            last_err = str(e)
+            attempts.append({"s2_code": code, "success": False, "error": last_err})
 
-        if ok:
-            return {"final": info, "attempts": attempts, "out_s2_tif": str(out_s2_tif)}
-
-
-    # for code_raw in prefer:
-    #     code = _norm_code(code_raw)
-    #     if code not in target_nm:
-    #         continue
-    #     if code not in s2_map:
-    #         attempts.append({"s2_code": code, "success": False, "error": f"{code} not in S2 template descriptions"})
-    #         continue
-
-    #     try:
-    #         CRL = COREG_LOCAL(
-    #             im_ref=str(emit_ref_tif),
-    #             im_tgt=str(s2_tgt_tif),
-    #             grid_res=float(grid_res),
-    #             max_points=int(max_points) if max_points is not None else None,
-    #             window_size=tuple(window_size),
-
-    #             path_out=str(out_s2_tif),
-    #             fmt_out="GTIFF",
-    #             out_crea_options=["TILED=YES", "COMPRESS=DEFLATE"],
-
-    #             r_b4match=int(emit_match[code]),
-    #             s_b4match=int(s2_map[code]),
-
-    #             max_shift=int(max_shift),
-    #             min_reliability=int(min_reliability),
-    #             tieP_filter_level=int(tieP_filter_level),
-
-    #             nodata=(nodata_emit, nodata_s2),
-    #             resamp_alg_calc=resamp_calc,
-    #             resamp_alg_deshift=resamp_deshift,
-
-    #             match_gsd=False,
-    #             align_grids=True,
-    #             out_gsd=list(out_gsd),
-
-    #         )
-
-    #         result = CRL.correct_shifts(cliptoextent=cliptoextent) 
-    #         ok = bool(getattr(CRL, "success", True)) 
-    #         info = {
-    #             "success": ok,
-    #             "s2_code": code,
-    #             "s2_match_band_1b": int(s2_map[code]),
-    #             "emit_match_band_1b": int(emit_match[code]),
-    #             "emit_match_wl_nm": float(emit_wl_nm[int(emit_match[code]) - 1]),
-    #             "grid_res": grid_res,
-    #             "max_points": max_points,
-    #             "result_keys": list(result.keys()) if isinstance(result, dict) else None,
-    #         }
-    #         attempts.append(info)
-
-    #         if ok:
-    #             return {"final": info, "attempts": attempts, "out_s2_tif": str(out_s2_tif)}
-
-    #     except Exception as e:
-    #         last_err = str(e)
-    #         attempts.append({"s2_code": code, "success": False, "error": last_err})
-
-    # return {"final": {"success": False, "error": last_err or "All attempts failed"}, "attempts": attempts, "out_s2_tif": str(out_s2_tif)}
+    return {"final": {"success": False, "error": last_err or "All attempts failed"}, "attempts": attempts, "out_s2_tif": str(out_s2_tif)}
