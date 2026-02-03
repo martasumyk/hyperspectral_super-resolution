@@ -621,3 +621,43 @@ def crop_s2_stack_to_te(
     if return_info:
         return out_path, crop_info
     return out_path
+
+def plot_s2_truecolor_from_stack(stack_path, ax=None):
+    with rasterio.open(stack_path) as ds:
+        desc = list(ds.descriptions)
+
+        def find_band(keywords):
+            for i, d in enumerate(desc, start=1):
+                if d is None:
+                    continue
+                d_low = d.lower()
+                if all(k in d_low for k in keywords):
+                    return i
+            return None
+
+        b_red   = find_band(["b04"]) or find_band(["red"])
+        b_green = find_band(["b03"]) or find_band(["green"])
+        b_blue  = find_band(["b02"]) or find_band(["blue"])
+
+        if not (b_red and b_green and b_blue):
+            raise ValueError(f"Can't find RGB bands in descriptions: {desc}")
+
+        arr = ds.read([b_red, b_green, b_blue]).astype("float32")
+
+    rgb = np.moveaxis(arr, 0, -1)
+
+    # reflectance scaling heuristic (keep yours)
+    if np.nanmax(rgb) > 1.5:
+        rgb = rgb / 10000.0
+
+    valid = np.isfinite(rgb)
+    p2, p98 = np.nanpercentile(rgb[valid], [2, 98])
+    rgb = np.clip((rgb - p2) / (p98 - p2 + 1e-6), 0, 1)
+
+    if ax is None:
+        _, ax = plt.subplots(figsize=(7, 7))
+
+    ax.imshow(rgb)
+    ax.set_title("Sentinel-2 true color (B04, B03, B02)")
+    ax.axis("off")
+    return rgb
