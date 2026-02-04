@@ -345,6 +345,8 @@ def save_tile_pair(
     with rasterio.open(emit_path) as emit_ds, rasterio.open(s2_path) as s2_ds:
         emit_tile = emit_ds.read(window=w_emit)   # (bands, H, W)
         s2_tile   = s2_ds.read(window=w_s2)
+        emit_desc = list(emit_ds.descriptions or [])
+        s2_desc   = list(s2_ds.descriptions or [])
 
         if emit_tile.size == 0:
             raise ValueError(f"Empty EMIT tile idx={k}, window={w_emit}")
@@ -414,6 +416,7 @@ def save_tile_pair(
             emit_profile.update(blockxsize=min(e_blk, ew), blockysize=min(e_blk, eh))
             s2_profile.update(blockxsize=min(s_blk, sw), blockysize=min(s_blk, sh))
 
+        
         with rasterio.open(emit_out, "w", **emit_profile) as dst_e:
             dst_e.write(emit_u16)
             if emit_ds_tags:
@@ -421,9 +424,18 @@ def save_tile_pair(
             for i, bt in enumerate(emit_band_tags, start=1):
                 if bt:
                     dst_e.update_tags(i, **bt)
+            for i in range(1, dst_e.count + 1):
+                d = emit_desc[i-1] if i-1 < len(emit_desc) else None
+                if d:
+                    dst_e.set_band_description(i, d)
 
         with rasterio.open(s2_out, "w", **s2_profile) as dst_s:
             dst_s.write(s2_tile)
+            for i in range(1, dst_s.count + 1):
+                d = s2_desc[i-1] if i-1 < len(s2_desc) else None
+                if d:
+                    dst_s.set_band_description(i, d)
+
 
     return emit_out, s2_out
 
