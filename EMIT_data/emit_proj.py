@@ -920,7 +920,7 @@ def nc_to_envi(
             cmd += ["-te", str(left), str(bottom), str(right), str(top)]
             cmd += ["-ts", str(cols), str(rows)]
             cmd += ["-srcnodata", str(NO_DATA_VALUE), "-dstnodata", str(NO_DATA_VALUE)]
-            cmd += ["-multi", "-wo", "NUM_THREADS=ALL_CPUS", "-wm", "16384"]
+            cmd += ["-multi", "-wo", "NUM_THREADS=ALL_CPUS", "-wm", "4096"]
             cmd += ["-r", "cubic", "-of", "ENVI", src_path, dst_path]
 
             rec = run_cmd(cmd, check=True)
