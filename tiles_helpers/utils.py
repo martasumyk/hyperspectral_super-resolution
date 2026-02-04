@@ -24,7 +24,7 @@ def plot_tile_pair_simple(
     emit_tile_path = Path(emit_tile_path)
     s2_tile_path   = Path(s2_tile_path)
 
-    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(10, 4))
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(8, 4))
 
     with rasterio.open(s2_tile_path) as ds_s2:
         desc = list(ds_s2.descriptions or [])
