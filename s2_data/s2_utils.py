@@ -151,8 +151,12 @@ def find_best_s2_for_emit_item(
             continue
 
         s2_dt = _to_utc(it.datetime)
+        print("s2_dt: ", s2_dt)
         s2_lst = local_solar_time_hours(s2_dt, anchor_lon)
+        print("s2_lst: ", s2_lst)
+        print("emit_lst:", emit_lst)
         tod_d = circ_hours_diff(emit_lst, s2_lst)
+        print("tod_d: ", tod_d)
         if tod_d > max_tod_diff_h:
             continue
 

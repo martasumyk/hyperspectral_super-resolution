@@ -586,7 +586,6 @@ def nc_to_envi(
       Path to the main projected ENVI cube (.bin)
     """
     def _finalize_and_return(out_path: Path):
-        # Save info if requested
         if save_info_path is not None:
             p = Path(save_info_path)
             p.parent.mkdir(parents=True, exist_ok=True)
@@ -644,21 +643,15 @@ def nc_to_envi(
         else:
             raise ValueError("Unrecognized input image dataset (expected 'radiance' or 'reflectance').")
         
-        # ---- Validate raw dimension order for GLT indexing ----
-        dims = getattr(data, "dimensions", None)  # netCDF4 Variable has .dimensions
-        # Expected: first two dims are (downtrack, crosstrack) in some wording
-        # We'll decide whether we need to transpose raw blocks.
+        dims = getattr(data, "dimensions", None)
 
         transpose_raw_yx = False
         if dims is not None and len(dims) >= 2:
             d0, d1 = str(dims[0]).lower(), str(dims[1]).lower()
 
-            # Heuristics: EMIT commonly uses "downtrack" and "crosstrack"
-            # If first dim looks like crosstrack and second like downtrack, we must swap.
             if ("crosstrack" in d0 and "downtrack" in d1) or ("x" == d0 and "y" == d1):
                 transpose_raw_yx = True
 
-            # If neither contains expected tokens, just print for manual verification
             if ("downtrack" not in d0 and "crosstrack" not in d0 and "along" not in d0 and "across" not in d0) or \
             ("downtrack" not in d1 and "crosstrack" not in d1 and "along" not in d1 and "across" not in d1):
                 print(f"[WARN] Unclear EMIT raw dims order: {dims}. Assuming data[y,x,...].")
@@ -666,7 +659,6 @@ def nc_to_envi(
             print("[WARN] data.dimensions not available; assuming data[y,x,...].")
 
         print(f"[DEBUG] data.dimensions={dims} -> transpose_raw_yx={transpose_raw_yx}")
-        # ------------------------------------------------------
 
 
         sbp = img_nc.groups["sensor_band_parameters"]
@@ -676,7 +668,6 @@ def nc_to_envi(
         # Geotransform/GLT
         gt = np.array(get_attr(img_nc, "geotransform"))
 
-        # ---- Guard: ENVI map_info cannot represent rotated/sheared geotransforms ----
         gt = np.asarray(gt, dtype=float)
         if len(gt) != 6:
             raise ValueError(f"Expected geotransform of length 6, got {len(gt)}: {gt}")
@@ -687,7 +678,6 @@ def nc_to_envi(
                 "ENVI 'map info' cannot represent rotation. "
                 f"gt={gt.tolist()}"
             )
-        # ---------------------------------------------------------------------------
 
         loc = img_nc.groups["location"]
         glt_x = np.asarray(loc.variables["glt_x"][:])
@@ -698,10 +688,8 @@ def nc_to_envi(
 
 
 
-        # valid in 1-based GLT space (0 means nodata)
         valid_glt = np.all(glt != 0, axis=-1)
 
-        # 0-based copy for indexing (safe + no double-decrement risk)
         glt0 = glt.copy()
         glt0[valid_glt] -= 1
 
@@ -745,7 +733,6 @@ def nc_to_envi(
             Y = y_ul + col * y_rot + row * y_res
             return (X, Y)
 
-        # Outer corners: (0,0), (W,0), (W,H), (0,H)
         c1 = _xy(0, 0)     # upper-left edge
         c2 = _xy(W, 0)     # upper-right edge
         c3 = _xy(W, H)     # lower-right edge
@@ -755,7 +742,6 @@ def nc_to_envi(
         corner_2 = [c2[0], c2[1]]
         corner_3 = [c3[0], c3[1]]
         corner_4 = [c4[0], c4[1]]
-        # ---------------------------------------------------------------------------
 
         map_info = [
             "Geographic Lat/Lon",
@@ -934,7 +920,7 @@ def nc_to_envi(
             cmd += ["-te", str(left), str(bottom), str(right), str(top)]
             cmd += ["-ts", str(cols), str(rows)]
             cmd += ["-srcnodata", str(NO_DATA_VALUE), "-dstnodata", str(NO_DATA_VALUE)]
-            cmd += ["-multi", "-wo", "NUM_THREADS=ALL_CPUS", "-wm", "2048"]
+            cmd += ["-multi", "-wo", "NUM_THREADS=ALL_CPUS", "-wm", "16384"]
             cmd += ["-r", "cubic", "-of", "ENVI", src_path, dst_path]
 
             rec = run_cmd(cmd, check=True)
