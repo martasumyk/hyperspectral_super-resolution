@@ -26,7 +26,6 @@ def plot_tile_pair_simple(
 
     fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(10, 4))
 
-    # ---------- S2 RGB ----------
     with rasterio.open(s2_tile_path) as ds_s2:
         desc = list(ds_s2.descriptions or [])
 
@@ -44,13 +43,16 @@ def plot_tile_pair_simple(
         b_blue  = find_band(["b02"]) or find_band(["blue"])
 
         if not (b_red and b_green and b_blue):
-            # fallback if your tile stack has no descriptions
             b_red, b_green, b_blue = 1, 2, 3
+
+        print("Picked RGB bands:",
+            (b_red, desc[b_red-1] if b_red and desc else None),
+            (b_green, desc[b_green-1] if b_green and desc else None),
+            (b_blue, desc[b_blue-1] if b_blue and desc else None))
 
         arr = ds_s2.read([b_red, b_green, b_blue]).astype(np.float32)
         rgb = np.moveaxis(arr, 0, -1)
 
-        # reflectance scaling heuristic (same as yours)
         if np.nanmax(rgb) > 1.5:
             rgb = rgb / 10000.0
 
@@ -127,9 +129,9 @@ def plot_tile_pair_simple(
             rgb = np.zeros_like(rgb)
 
         if emit_wls is not None:
-            ax2.set_title(f"EMIT tile {title_suffix}\nRGB≈{emit_rgb_nm}nm → bands {emit_bands} (wl {emit_wls})")
+            ax2.set_title(f"EMIT tile {title_suffix}\nRGB bands {emit_bands}")
         else:
-            ax2.set_title(f"EMIT tile {title_suffix}\nRGB bands {emit_bands} (no wl metadata)")
+            ax2.set_title(f"EMIT tile {title_suffix}\nRGB bands {emit_bands} (no wl)")
         ax2.imshow(rgb)
         ax2.axis("off")
 
