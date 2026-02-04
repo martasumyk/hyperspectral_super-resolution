@@ -6,41 +6,131 @@ from rasterio.windows import Window
 from rasterio.windows import from_bounds, transform as window_transform
 
 
-def plot_tile_pair_simple(emit_tile_path, s2_tile_path, title_suffix="", save_path=None, show=True):
+from pathlib import Path
+import numpy as np
+import rasterio
+import matplotlib.pyplot as plt
+import re
+
+def plot_tile_pair_simple(
+    emit_tile_path,
+    s2_tile_path,
+    title_suffix="",
+    save_path=None,
+    show=True,
+    emit_wavelengths_nm=None,          # optional: list/np.array length == ds_e.count
+    emit_rgb_nm=(650, 560, 470),       # (R,G,B) target wavelengths in nm
+):
     emit_tile_path = Path(emit_tile_path)
     s2_tile_path   = Path(s2_tile_path)
 
     fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(10, 4))
 
+    # ---------- S2 RGB ----------
     with rasterio.open(s2_tile_path) as ds_s2:
-        rgb = ds_s2.read([1, 2, 3]).transpose(1, 2, 0).astype(np.float32)
-        vmin = np.percentile(rgb, 2)
-        vmax = np.percentile(rgb, 98)
-        rgb = np.clip((rgb - vmin) / (vmax - vmin + 1e-6), 0, 1)
+        desc = list(ds_s2.descriptions or [])
+
+        def find_band(keywords):
+            for i, d in enumerate(desc, start=1):
+                if d is None:
+                    continue
+                d_low = d.lower()
+                if all(k in d_low for k in keywords):
+                    return i
+            return None
+
+        b_red   = find_band(["b04"]) or find_band(["red"])
+        b_green = find_band(["b03"]) or find_band(["green"])
+        b_blue  = find_band(["b02"]) or find_band(["blue"])
+
+        if not (b_red and b_green and b_blue):
+            # fallback if your tile stack has no descriptions
+            b_red, b_green, b_blue = 1, 2, 3
+
+        arr = ds_s2.read([b_red, b_green, b_blue]).astype(np.float32)
+        rgb = np.moveaxis(arr, 0, -1)
+
+        # reflectance scaling heuristic (same as yours)
+        if np.nanmax(rgb) > 1.5:
+            rgb = rgb / 10000.0
+
+        nod = ds_s2.nodata
+        if nod is not None:
+            valid = np.all(rgb != nod, axis=2) & np.all(np.isfinite(rgb), axis=2)
+        else:
+            valid = np.all(np.isfinite(rgb), axis=2)
+
+        if np.any(valid):
+            p2, p98 = np.nanpercentile(rgb[valid], [2, 98])
+            rgb = np.clip((rgb - p2) / (p98 - p2 + 1e-6), 0, 1)
+        else:
+            rgb = np.zeros_like(rgb)
+
         ax1.imshow(rgb)
-        ax1.set_title(f"S2 tile {title_suffix}")
+        ax1.set_title(f"S2 tile {title_suffix}\n(B04,B03,B02) → ({b_red},{b_green},{b_blue})")
         ax1.axis("off")
 
     with rasterio.open(emit_tile_path) as ds_e:
-        best_b, best_var = 1, -1.0
-        for b in range(1, ds_e.count + 1):
-            arr = ds_e.read(b).astype(np.float32)
-            v = float(np.var(arr))
-            if v > best_var:
-                best_var = v
-                best_b = b
+        nod = ds_e.nodata
 
-        band = ds_e.read(best_b).astype(np.float32)
-        vmin = np.percentile(band, 2)
-        vmax = np.percentile(band, 98)
-        img = (band - vmin) / (vmax - vmin + 1e-6)
-        img = np.clip(img, 0, 1) ** 0.5
+        wl = None
+        if emit_wavelengths_nm is not None:
+            wl = np.asarray(emit_wavelengths_nm, dtype=np.float32)
+            if wl.size != ds_e.count:
+                wl = None 
 
-        print(f"[{title_suffix}] EMIT band {best_b}, var={best_var:.3e}, "
-              f"min={band.min()}, max={band.max()}")
+        if wl is None:
+            desc = list(ds_e.descriptions or [])
+            parsed = []
+            for d in desc:
+                if not d:
+                    parsed.append(np.nan)
+                    continue
+                m = re.search(r"(\d+(\.\d+)?)", d)
+                if not m:
+                    parsed.append(np.nan)
+                    continue
+                v = float(m.group(1))
+                if v < 10:
+                    v *= 1000.0
+                parsed.append(v)
+            parsed = np.asarray(parsed, dtype=np.float32)
+            if np.isfinite(parsed).sum() >= 10:  # enough to trust
+                wl = parsed
 
-        ax2.imshow(img, cmap="gray", vmin=0, vmax=1)
-        ax2.set_title(f"EMIT tile {title_suffix}\n(best band {best_b})")
+        if wl is not None:
+            bR = int(np.nanargmin(np.abs(wl - emit_rgb_nm[0]))) + 1
+            bG = int(np.nanargmin(np.abs(wl - emit_rgb_nm[1]))) + 1
+            bB = int(np.nanargmin(np.abs(wl - emit_rgb_nm[2]))) + 1
+            emit_bands = [bR, bG, bB]
+            emit_wls   = [float(wl[bR-1]), float(wl[bG-1]), float(wl[bB-1])]
+        else:
+            n = ds_e.count
+            emit_bands = [int(round(0.85*(n-1)))+1, int(round(0.55*(n-1)))+1, int(round(0.25*(n-1)))+1]
+            emit_wls = None
+
+        arr = ds_e.read(emit_bands).astype(np.float32)  # (3,H,W)
+        rgb = np.moveaxis(arr, 0, -1)
+
+        if np.nanmax(rgb) > 1.5:
+            rgb = rgb / 10000.0
+
+        if nod is not None:
+            valid = np.all(rgb != nod, axis=2) & np.all(np.isfinite(rgb), axis=2)
+        else:
+            valid = np.all(np.isfinite(rgb), axis=2)
+
+        if np.any(valid):
+            p2, p98 = np.nanpercentile(rgb[valid], [2, 98])
+            rgb = np.clip((rgb - p2) / (p98 - p2 + 1e-6), 0, 1)
+        else:
+            rgb = np.zeros_like(rgb)
+
+        if emit_wls is not None:
+            ax2.set_title(f"EMIT tile {title_suffix}\nRGB≈{emit_rgb_nm}nm → bands {emit_bands} (wl {emit_wls})")
+        else:
+            ax2.set_title(f"EMIT tile {title_suffix}\nRGB bands {emit_bands} (no wl metadata)")
+        ax2.imshow(rgb)
         ax2.axis("off")
 
     plt.tight_layout()
@@ -54,6 +144,56 @@ def plot_tile_pair_simple(emit_tile_path, s2_tile_path, title_suffix="", save_pa
         plt.show()
 
     plt.close(fig)
+
+
+# def plot_tile_pair_simple(emit_tile_path, s2_tile_path, title_suffix="", save_path=None, show=True):
+#     emit_tile_path = Path(emit_tile_path)
+#     s2_tile_path   = Path(s2_tile_path)
+
+#     fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(10, 4))
+
+#     with rasterio.open(s2_tile_path) as ds_s2:
+#         rgb = ds_s2.read([1, 2, 3]).transpose(1, 2, 0).astype(np.float32)
+#         vmin = np.percentile(rgb, 2)
+#         vmax = np.percentile(rgb, 98)
+#         rgb = np.clip((rgb - vmin) / (vmax - vmin + 1e-6), 0, 1)
+#         ax1.imshow(rgb)
+#         ax1.set_title(f"S2 tile {title_suffix}")
+#         ax1.axis("off")
+
+#     with rasterio.open(emit_tile_path) as ds_e:
+#         best_b, best_var = 1, -1.0
+#         for b in range(1, ds_e.count + 1):
+#             arr = ds_e.read(b).astype(np.float32)
+#             v = float(np.var(arr))
+#             if v > best_var:
+#                 best_var = v
+#                 best_b = b
+
+#         band = ds_e.read(best_b).astype(np.float32)
+#         vmin = np.percentile(band, 2)
+#         vmax = np.percentile(band, 98)
+#         img = (band - vmin) / (vmax - vmin + 1e-6)
+#         img = np.clip(img, 0, 1) ** 0.5
+
+#         print(f"[{title_suffix}] EMIT band {best_b}, var={best_var:.3e}, "
+#               f"min={band.min()}, max={band.max()}")
+
+#         ax2.imshow(img, cmap="gray", vmin=0, vmax=1)
+#         ax2.set_title(f"EMIT tile {title_suffix}\n(best band {best_b})")
+#         ax2.axis("off")
+
+#     plt.tight_layout()
+
+#     if save_path is not None:
+#         save_path = Path(save_path)
+#         save_path.parent.mkdir(parents=True, exist_ok=True)
+#         fig.savefig(save_path, dpi=150, bbox_inches="tight")
+
+#     if show:
+#         plt.show()
+
+#     plt.close(fig)
 
 
 def is_black_mask(arr, nodata=None, masked_val=-0.01,
